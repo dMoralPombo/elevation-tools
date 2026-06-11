@@ -229,36 +229,98 @@ def extract_dem_from_archive(archive_path):
         return None
 
 
-def find_and_unzip(base_path):
-    """Find DEM file, extracting from archive if needed.
-    
-    Parameters
-    ----------
-    base_path : str
-        Base path to search
-        
-    Returns
-    -------
-    str or None
-        Path to usable DEM file
+def find_and_unzip(pathfile):
     """
-    # Try existing .tif first
-    tif_path = find_dem_file(base_path)
-    if tif_path:
-        return tif_path
-    
-    # Look for archives
-    patterns = [base_path + '*.gz']
-    if base_path.endswith('.tar.gz'):
-        patterns.append(base_path[:-7] + '*.gz')
-    
-    for pattern in patterns:
-        matches = glob.glob(pattern)
-        if matches:
-            return extract_dem_from_archive(matches[0])
-    
-    print(f"No DEM file found for: {base_path}")
-    return None
+    Finds a .tif file and/or unzips the .gz file if necessary.
+
+    Args:
+        pathfile (str): Path to the file without extension.
+
+    Returns:
+        str: Path to the .tif file if found or extracted, otherwise None.
+
+    Exceptions:
+        FileNotFoundError: If the .gz file or .tif file is not found.
+        gzip.BadGzipFile: If the .gz file is not a valid gzip file.
+        tarfile.TarError: If there is an error extracting the tar file.
+        Exception: For any other exceptions, returns None and prints the error message.
+    """
+    if pathfile.endswith(".tar.gz"):
+        tif_file_pattern = pathfile[:-7] + "*_dem.tif"
+    elif pathfile.endswith("_dem.tif"):
+        tif_file_pattern = pathfile
+    else:
+        tif_file_pattern = pathfile[:-20] + "*_dem.tif"
+    # tif_file_pattern = pathfile + "*_dem.tif"
+    tif_file_list = glob.glob(tif_file_pattern)
+    if tif_file_list:
+        shortened_path = (
+            ".../"
+            + tif_file_list[0].split("/")[-2]
+            + "/"
+            + tif_file_list[0].split("/")[-1]
+        )
+        print(f"Found existing .tif file: {shortened_path}")
+        return tif_file_list[0]
+
+    gz_file_list = glob.glob(pathfile[:-25] + "*.gz")
+    if not gz_file_list:
+        print(f"⚠ No .gz found for {pathfile}. Skipping.")
+        return None
+
+    gz_file = gz_file_list[0]
+    extracted_dir = os.path.dirname(gz_file)
+
+    shortened_path_gz = ".../" + gz_file.split("/")[-2] + "/" + gz_file.split("/")[-1]
+    print(f"Unzipping .gz file: {shortened_path_gz}")
+
+    try:
+        # Check if .gz contains a .tif directly
+        with gzip.open(gz_file, "rb") as f_in:
+            magic = f_in.read(4)  # Read first bytes to check type
+
+        if magic.startswith(b"II") or magic.startswith(b"MM"):  # TIFF signature
+            # Extract directly to a .tif file
+            tif_file = gz_file[:-3]  # Remove .gz extension
+            with gzip.open(gz_file, "rb") as f_in, open(tif_file, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            print(f"Extracted TIFF: {tif_file}")
+            return tif_file
+
+        # Otherwise, assume .tar file inside
+        tar_file = gz_file[:-3]  # Remove .gz
+
+        with gzip.open(gz_file, "rb") as f_gz:
+            print("Opening gzip file")
+            with open(tar_file, "wb") as f_tar:
+                print("Copying gzip content to tar file")
+                shutil.copyfileobj(f_gz, f_tar)
+
+        with tarfile.open(tar_file, "r") as tar:
+            print("Opening tar file and extracting...")
+            tar.extractall(path=extracted_dir)
+            # print(f"Extracted contents of .../{tar_file.split('/')[-2]}/{tar_file.split('/')[-1]}")
+
+        os.remove(tar_file)
+
+        # Refresh search for .tif file
+        tif_file_list = glob.glob(f"{pathfile[:-25]}*_dem.tif")
+        if tif_file_list and len(tif_file_list) < 1:
+            print(f"⚠ No .tif files found: {tif_file_list}. Skipping...")
+        return tif_file_list[0] if tif_file_list else None
+
+    except FileNotFoundError as e:
+        print(f"⚠ File not found: {e}")
+        return None
+    except gzip.BadGzipFile as e:
+        print(f"⚠ Bad GZIP file: {e}")
+        return None
+    except tarfile.TarError as e:
+        print(f"⚠ Error extracting TAR file: {e}")
+        return None
+    except Exception as e:
+        print(f"⚠ Unexpected error: {e}\n for file {gz_file}")
+        return None
 
 
 # ============================================================================
@@ -321,6 +383,231 @@ def get_elevation_window(src, x, y, window_size=DEFAULT_WINDOW_SIZE,
     
     return float(np.mean(valid)), float(np.std(valid)), len(valid)
 
+
+def transform_to_3413(point_wgs84):
+    """
+    Transform WGS84 (lon,lat) coordinates to EPSG:3413.
+    Parameters:
+    ----------
+    point_wgs84 : tuple
+        Tuple containing two tuples: (start_point, end_point) in WGS84 (lon, lat)
+
+    Returns:
+    -------
+    tuple
+        Transformed coordinates in EPSG:3413
+    """
+    # Convert to EPSG:3413
+    point = warp.transform(
+        # src_crs='EPSG:3857',
+        src_crs="EPSG:4326",
+        dst_crs="EPSG:3413",
+        xs=[point_wgs84[0]],
+        ys=[point_wgs84[1]],
+    )
+
+    # Format as tuples (x,y)
+    return (point[0][0], point[1][0])
+
+
+def transect_from_mosaic(coords_4326, num_samples=100):
+    """Get elevation profile from a mosaic using provided origin and end coordinates.
+
+    Parameters:
+    -----------
+    coords_4326 : tuple
+        Tuple containing two tuples: (start_point, end_point) in EPSG:4326 (lon, lat)
+    num_samples : int, optional
+        Number of points to sample along the profile (default: 100)
+
+    Returns:
+    --------
+    dict
+        Dictionary containing profile data and metadata
+    """
+    print(f"Finding mosaic file for coordinates {coords_4326}")
+    lon_A, lat_A = coords_4326[0]
+    lon_B, lat_B = coords_4326[1]
+
+    # Search for the mosaic index
+    mosaicdir = "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/mosaic/"
+    mosaicindexdir = "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/ArcticDEM_Mosaic_Index_latest_shp/"
+    mosaic_index = mosaicindexdir + "ArcticDEM_Mosaic_Index_v4_1_2m.shp"
+
+    # Read mosaic_index shapefile
+    mosaic_gdf = gpd.read_file(mosaic_index)
+
+    # Find the mosaic file that contains the point
+    point_A = gpd.GeoSeries([gpd.points_from_xy([lon_A], [lat_A])[0]], crs="EPSG:4326")
+    point_B = gpd.GeoSeries([gpd.points_from_xy([lon_B], [lat_B])[0]], crs="EPSG:4326")
+    point_A = point_A.to_crs("EPSG:3413")
+    point_B = point_B.to_crs("EPSG:3413")
+
+    # Search GeoDataFrame for the polygon containing the point
+    containing_polygons_A = mosaic_gdf[mosaic_gdf.geometry.contains(point_A.iloc[0])]
+    # if containing_polygons_A.empty:
+    #     raise ValueError(f"No mosaic found containing point_A {coords[0]}")
+    containing_polygons_B = mosaic_gdf[mosaic_gdf.geometry.contains(point_B.iloc[0])]
+    # if containing_polygons_B.empty:
+    #     raise ValueError(f"No mosaic found containing point_B {coords[1]}")
+
+    if containing_polygons_A.empty and containing_polygons_B.empty:
+        raise ValueError(f"No mosaic found containing either point_A {coords_4326[0]} or point_B {coords_4326[1]}")
+    if containing_polygons_A.empty:
+        containing_polygons_A = containing_polygons_B
+    if containing_polygons_B.empty:
+        containing_polygons_B = containing_polygons_A
+
+    # Find the mosaic tile
+    tile_A = containing_polygons_A.iloc[0]["tile"]
+    tile_B = containing_polygons_B.iloc[0]["tile"]
+    if tile_A == tile_B:
+        print(f"✓ Both points are in the same mosaic tile: {tile_A}")
+        supertile = containing_polygons_A.iloc[0]["supertile"]
+        tile_id = tile_A + "_2m_v4.1"
+
+        # Construct the expected mosaic file path
+        mosaic_dem = f"{mosaicdir}v4.1/2m/{supertile}/{tile_id}_dem.tif"
+        if not mosaic_dem:
+            raise FileNotFoundError(f"No mosaic file found for coordinates {coords_4326}.")
+
+        rasterpath = mosaic_dem
+        print(f"Using mosaic file: {rasterpath}")
+
+        return extract_elevation_profile_compressed(coords_4326, rasterpath, num_samples)
+
+    # This is a mess that will not work by now because the transect crosses two tiles
+    else:
+        print(
+            f"⚠ Warning: Start and end points are in different mosaic tiles ({tile_A} & {tile_B}). Not working yet."
+        )
+        return None, None, None, None, None, None, None  # by now
+
+        supertile_A = containing_polygons_A.iloc[0]["supertile"]
+        tile_id_A = tile_A + "_2m_v4.1"
+        mosaic_dem_A = f"{mosaicdir}v4.1/2m/{supertile_A}/{tile_id_A}_dem.tif"
+        if not mosaic_dem_A:
+            raise FileNotFoundError(f"No mosaic file found for coordinates {coords_4326}.")
+        rasterpath_A = mosaic_dem_A
+
+        supertile_B = containing_polygons_B.iloc[0]["supertile"]
+        tile_id_B = tile_B + "_2m_v4.1"
+        mosaic_dem_B = f"{mosaicdir}v4.1/2m/{supertile_B}/{tile_id_B}_dem.tif"
+        if not mosaic_dem_B:
+            raise FileNotFoundError(f"No mosaic file found for coordinates {coords_4326}.")
+        rasterpath_B = mosaic_dem_B
+        print(f"Using mosaic files: {rasterpath_A} and {rasterpath_B}")
+        return extract_elevation_profile_compressed(coords_4326, rasterpath_B, num_samples)
+
+
+def extract_elevation_profile_compressed(
+    coords_4326, rasterpath, num_samples=100
+):
+    """Process elevation profile using provided origin and end coordinates from compressed files.
+
+    Parameters:
+    -----------
+    coords_4326 : tuple
+        Tuple containing two tuples: (start_point, end_point) in EPSG:4326 (lon, lat)
+    rasterpath : str
+        Path to the raster file or compressed archive
+    num_samples : int, optional
+        Number of points to sample along the profile (default: 100)
+
+    Returns:
+    --------
+    dict
+        Dictionary containing profile data and metadata
+    """
+    # print(f'Transforming points from EPSG:4326 to EPSG:3413.')
+    origin_coords = transform_to_3413(coords_4326[0])
+    end_coords = transform_to_3413(coords_4326[1])
+
+    if origin_coords is None or end_coords is None:
+        raise ValueError("Both start and end coordinates must be provided")
+
+    # Find the compressed file
+    gzfile = glob.glob(rasterpath[:-8] + "*.gz")
+    if not gzfile:
+        gzfile = glob.glob(rasterpath[:-18] + "*.gz")
+        if not gzfile:
+            gzfile = glob.glob(rasterpath[:-18] + "*_dem.tif")
+            if not gzfile:
+                raise ValueError("No suitable raster file found")
+
+    def read_profile_from_memfile(src, x0, y0, x1, y1, num_samples):
+        """Read elevation profile from opened raster."""
+        # Validate coordinates against raster bounds
+        bounds = src.bounds
+        if not (
+            bounds.left <= x0 <= bounds.right and bounds.bottom <= y0 <= bounds.top
+        ):
+            raise ValueError(f"Origin coordinates ({x0}, {y0}) outside bounds {bounds}")
+        if not (
+            bounds.left <= x1 <= bounds.right and bounds.bottom <= y1 <= bounds.top
+        ):
+            raise ValueError(f"End coordinates ({x1}, {y1}) outside bounds {bounds}")
+
+        # Calculate the actual distance of the transect
+        transect_distance = np.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+        transect = np.linspace(0, transect_distance, num_samples)
+
+        # Generate world coordinates along the profile line
+        # print(f"Generating {num_samples} points along profile line")
+        x_coords = np.linspace(x0, x1, num_samples)
+        y_coords = np.linspace(y0, y1, num_samples)
+
+        # Convert world coordinates to pixel indices
+        # rows, cols = src.index(x_coords, y_coords)  # Old way
+        rows = []
+        cols = []
+        for i in range(num_samples):
+            x_coord = x_coords[i]
+            y_coord = y_coords[i]
+            row, col = src.index(x_coord, y_coord)
+            rows.append(row)
+            cols.append(col)
+
+        # Extract elevation values using bilinear interpolation
+        profile_values = []
+        for row, col in zip(rows, cols):
+            if 0 <= row < src.height and 0 <= col < src.width:
+                val = src.read(1, window=((row, row + 1), (col, col + 1)))[0, 0]
+                profile_values.append(np.nan if val == src.nodata else val)
+            else:
+                profile_values.append(np.nan)
+
+        profile_values = np.array(profile_values)
+        print(
+            f"Elevation range: {np.nanmin(profile_values):.1f} to {np.nanmax(profile_values):.1f} meters"
+        )
+
+        return transect, profile_values, transect_distance, x0, y0, x1, y1
+
+    if gzfile[0].endswith(".tar.gz"):
+        with tarfile.open(gzfile[0], "r:gz") as tar:
+            # Find the DEM file in the archive
+            dem_member = next(
+                (m for m in tar.getmembers() if m.name.endswith("_dem.tif")), None
+            )
+            if not dem_member:
+                raise ValueError("No DEM file found in archive")
+
+            # Extract just the needed portion to memory
+            with tar.extractfile(dem_member) as f:
+                with rio.MemoryFile(f.read()) as memfile:
+                    with memfile.open() as src:
+                        return read_profile_from_memfile(
+                            src, *origin_coords, *end_coords, num_samples
+                        )
+    elif gzfile[0].endswith(".tif"):
+        with rio.open(gzfile[0]) as src:
+            return read_profile_from_memfile(
+                src, *origin_coords, *end_coords, num_samples
+            )
+    else:
+        raise ValueError("Unsupported file format")
+    
 
 def extract_elevation_profile(coords_4326, raster_path, num_samples=100):
     """Extract elevation profile between two points.

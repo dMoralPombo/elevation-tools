@@ -14,25 +14,25 @@ from pathlib import Path
 # Main archive directory for ArcticDEM strip files
 ARCHIVE_DIR = os.getenv(
     'ARCTICDEM_ARCHIVE_DIR',
-    "~/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/strips/s2s041/2m/"
+    "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/strips/s2s041/2m/"
 )
 
 # Mosaic directory
 MOSAIC_DIR = os.getenv(
     'ARCTICDEM_MOSAIC_DIR',
-    "~/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/mosaic/v4.1/2m/"
+    "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/mosaic/v4.1/2m/"
 )
 
 # Mosaic index shapefile directory
 MOSAIC_INDEX_DIR = os.getenv(
     'ARCTICDEM_MOSAIC_INDEX_DIR',
-    "~/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/ArcticDEM_Mosaic_Index_latest_shp/"
+    "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/ArcticDEM_Mosaic_Index_latest_shp/"
 )
 
 # Output directory for results
 OUTPUT_DIR = os.getenv(
     'ARCTICDEM_OUTPUT_DIR',
-    "~/luna/CPOM/{your_username}/{whatever_folder}/"
+    "/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/elevation_histories/"
 )
 
 # ============================================================================
