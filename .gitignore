@@ -1,0 +1,62 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data files
+*.tif
+*.gz
+*.tar.gz
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.xml
+
+# Output directories
+outputs/
+results/
+*.png
+*.jpg
+*.pdf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.directory
+
+# Personal configuration (users should create their own)
+config_local.py
+*.local
+
+# Secrets and tokens
+*.token
+*.secret
+.env
+
+# Large data
+data/
+archives/
+EOF
