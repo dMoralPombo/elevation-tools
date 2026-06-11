@@ -14,27 +14,25 @@ Tools for extracting and analyzing elevation profiles and time series from the [
 - **Multiple Coregistration Modes**: Support for raw, altimetry-coregistered, and mosaic-coregistered DEMs
 - **Automatic STAC Queries**: Search the ArcticDEM catalog by location and time range
 
-## Installation
+# Installation
 
-```bash
-# Clone the repository
+## Clone the repository
 git clone https://github.com/dMoralPombo/elevation-tools.git
 cd elevation_tools
 
-# Install dependencies
+## Install dependencies
 pip install -r requirements.txt
 
-## Configuration
+# Configuration
 
 Before using, edit `config.py` to set your data paths:
 
-```python
-# Edit config.py
+### Edit config.py
 nano config_local.py  # Edit the paths
 ARCHIVE_DIR = "/your/archive/path/"
 MOSAIC_DIR = "/your/mosaic/path/"
 
-# Data Requirements
+## Data Requirements
 You need access to:
 
 ArcticDEM Strip Archive: The s2s041/2m/ directory containing SETSM DEM files (.tif or .tar.gz)
@@ -44,9 +42,9 @@ Mosaic Index Shapefile (optional): ArcticDEM_Mosaic_Index_v4_1_2m.shp for mosaic
 The tools access the PGC STAC API to discover available DEMs, so an internet connection is required for the catalog search 
 (at least by now until we use a Lancaster/CPOM-based catalogue).
 
-## Usage
+# Usage
 
-# Jupyter Notebook (Recommended)
+## Jupyter Notebook (Recommended)
 The primary interface is through Jupyter notebooks:
 
 jupyter notebook
@@ -66,7 +64,7 @@ This is the stable and fully functional notebook. Use it to:
 
 5. Export data as CSV and figures
 
-# Key parameters:
+## Key parameters:
 
 WINDOW_SIZE: Number of pixels for elevation averaging (3 = 3x3 window)
 
@@ -76,27 +74,37 @@ COREG_MODE: 'none' (raw DEMs), 'altim' (CryoSat-2 coregistered), 'mosaic' (mosai
 
 TIME_RANGE: Date range in format "YYYY-MM-DD/YYYY-MM-DD" (total PGC range: 2009-2025)
 
-# Output Structure
+## Output Structure
 
 outputs/
+
 ├── elevation_histories/
+
 │   ├── elevation_history_-54.200_75.000_nc_2010-2020.png   # Plot
+
 │   └── elevation_history_-54.200_75.000_nc_2010-2020.txt   # Data
+
 ├── transects/
+
 │   └── profile_SETSM_20150701_...png                         # Individual profiles
+
 └── transects_combined/
+
     ├── combined_profiles_-54.200_75.000_...txt               # Combined data
+    
     └── profile_-54.200_75.000_...png                         # Combined plot
 
-# Coregistration Modes
+## Coregistration Modes
 
 Mode	Description	File Pattern	Use Case
 none	Raw compressed DEMs	*_dem.tif.gz or *.tar.gz	Original SETSM elevations
 altim	CryoSat-2 coregistered	*cs2*coregistered.tif	Corrected to altimetry
 mosaic	Mosaic-coregistered	*mosaic*coregistered.tif	Corrected to ArcticDEM mosaic
+
 Coregistration parameters are configured in config.py under COREG_PARAMS.
 
-# Window Types
+## Window Types
+
 The elevation extraction uses a window of pixels around the target coordinates:
 
 -Square (window_type='square'): Full N×N window averaging
@@ -113,7 +121,8 @@ Window size examples:
 
 Larger windows provide more robust elevation estimates with uncertainty (standard deviation).
 
-# Limitations
+## Limitations
+
 -Coordinate System: Currently hardcoded for Greenland (EPSG:3413). For other Arctic regions, modify the CRS in config.py.
 
 -DEM Source: Only supports the arcticdem-strips-s2s041-2m collection from PGC.
@@ -147,12 +156,15 @@ MIT License - see LICENSE file for details.
 # Citation
 
 If you use this tool in your research, please cite:
+
 -Porter, C., et al. (2023). ArcticDEM. Harvard Dataverse. https://doi.org/10.7910/DVN/OHHUKH
 
 # Contact
 
 -Author: Diego Moral Pombo
+
 -Email: d.moralpombo@lancaster.ac.uk
+
 -GitHub: @dMoralPombo
 
 # Acknowledgments
