@@ -32,7 +32,7 @@ MOSAIC_INDEX_DIR = os.getenv(
 # Output directory for results
 OUTPUT_DIR = os.getenv(
     'ARCTICDEM_OUTPUT_DIR',
-    "/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/elevation_histories/"
+    "/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/"
 )
 
 # ============================================================================

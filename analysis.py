@@ -37,39 +37,88 @@ from config import (
 # ============================================================================
 
 def extract_date_label(dem_name):
-    """Extract readable date from DEM filename."""
+    """Extract readable date from DEM filename.
+    
+    Handles names like:
+    - 'SETSM_s2s041_WV01_20150701_2m_lsf_seg1_dem'
+    - 'SETSM_s2s041_20150701_2m_lsf_seg1_dem'
+    
+    Parameters
+    ----------
+    dem_name : str
+        DEM filename
+        
+    Returns
+    -------
+    str
+        Human-readable date string (e.g., 'Jul 2015')
+    """
     parts = dem_name.split("_")
-    if len(parts) > 1 and len(parts[1]) >= 6:
-        date_str = parts[1]
-        year = date_str[:4]
-        month = date_str[4:6]
-        month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        try:
-            return f"{month_names[int(month)]} {year}"
-        except (ValueError, IndexError):
-            return f"{year}-{month}"
-    return dem_name[:8]
+    
+    # Look for an 8-digit date string in any part
+    for part in parts:
+        if len(part) == 8 and part.isdigit():
+            year = part[:4]
+            month = part[4:6]
+            month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+            try:
+                return f"{month_names[int(month)]} {year}"
+            except (ValueError, IndexError):
+                return f"{year}-{month}"
+    
+    # Fallback: return first 20 chars of filename
+    return dem_name[:20]
 
 
 def extract_year(dem_name):
-    """Extract year from DEM filename."""
+    """Extract year from DEM filename.
+    
+    Parameters
+    ----------
+    dem_name : str
+        DEM filename
+        
+    Returns
+    -------
+    int
+        Year, or 0 if not found
+    """
     parts = dem_name.split("_")
-    if len(parts) > 1 and len(parts[1]) >= 4:
-        return int(parts[1][:4])
+    
+    # Look for an 8-digit date string in any part
+    for part in parts:
+        if len(part) == 8 and part.isdigit():
+            return int(part[:4])
+    
     return 0
 
 
 def extract_date_obj(dem_name):
-    """Extract datetime object from DEM filename."""
+    """Extract datetime object from DEM filename.
+    
+    Parameters
+    ----------
+    dem_name : str
+        DEM filename
+        
+    Returns
+    -------
+    datetime
+        Date object
+    """
     parts = dem_name.split("_")
-    if len(parts) > 1 and len(parts[1]) >= 8:
-        try:
-            return datetime.strptime(parts[1][:8], "%Y%m%d")
-        except:
-            return datetime(int(parts[1][:4]), 1, 1)
+    
+    # Look for an 8-digit date string in any part
+    for part in parts:
+        if len(part) == 8 and part.isdigit():
+            try:
+                return datetime.strptime(part, "%Y%m%d")
+            except:
+                pass
+    
+    # Fallback
     return datetime(2000, 1, 1)
-
 
 # ============================================================================
 # ELEVATION HISTORY PROCESSING
@@ -258,7 +307,7 @@ def process_elevation_profiles(
                 dem_name = f"SETSM_{pairname}"
                 transect, elevations, distance, x0, y0, x1, y1 = \
                     extract_elevation_profile(transect_coords, raster_path, num_samples)
-            
+
             all_profiles['profiles'].append({
                 'transect': transect,
                 'profile_values': elevations,
@@ -568,20 +617,21 @@ def plot_combined_profiles(all_profiles, coreg_mode='none',
 
     # Plot each profile
     for i, profile in enumerate(all_profiles["profiles"]):
-        # Extract year and month for label
-        dem_name = profile["metadata"]["dem_name"]
-        dem_parts = dem_name.split("_")
-        if len(dem_parts) > 1 and len(dem_parts[1]) >= 6:
-            date_str = dem_parts[1]
-            year, month = date_str[:4], date_str[4:6]
-            month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", 
-                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-            try:
-                label = f"{month_names[int(month)]} {year}"
-            except (ValueError, IndexError):
-                label = dem_parts[1][:6] if len(dem_parts[1]) >= 6 else dem_parts[1]
-        else:
-            label = dem_parts[1] if len(dem_parts) > 1 else dem_name
+        # # Extract year and month for label
+        # dem_name = profile["metadata"]["dem_name"]
+        # dem_parts = dem_name.split("_")
+        # if len(dem_parts) > 1 and len(dem_parts[1]) >= 6:
+        #     date_str = dem_parts[1]
+        #     year, month = date_str[:4], date_str[4:6]
+        #     month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+        #                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        #     try:
+        #         label = f"{month_names[int(month)]} {year}"
+        #     except (ValueError, IndexError):
+        #         label = dem_parts[1][:6] if len(dem_parts[1]) >= 6 else dem_parts[1]
+        # else:
+        #     label = dem_parts[1] if len(dem_parts) > 1 else dem_name
+        date_label = extract_date_label(profile["metadata"]["dem_name"])
 
         profvalues = np.array(profile["profile_values"])
         elprofile = np.ma.masked_where(profvalues < -5000, profvalues)
@@ -590,7 +640,7 @@ def plot_combined_profiles(all_profiles, coreg_mode='none',
                         elprofile.mask)
         filtered_profile = np.ma.masked_where(combined_mask, elprofile)
         ax3.plot(profile["transect"], filtered_profile, color=colors[i], 
-                label=label, linewidth=1.5)
+                label=date_label, linewidth=1.5)
 
     # Format right plot
     ax3.set_xlabel("Distance along transect (m)", fontsize=11)
@@ -652,8 +702,10 @@ def plot_combined_profiles(all_profiles, coreg_mode='none',
     coords_4326 = all_profiles["transect_coords"]
     xs, ys = coords_4326[0]
     xe, ye = coords_4326[1]
-    yearstart = all_profiles["profiles"][-1]["metadata"]["dem_name"].split("_")[1][:4]
-    yearend = all_profiles["profiles"][0]["metadata"]["dem_name"].split("_")[1][:4]
+    # yearstart = all_profiles["profiles"][-1]["metadata"]["dem_name"].split("_")[1][:4]
+    # yearend = all_profiles["profiles"][0]["metadata"]["dem_name"].split("_")[1][:4]
+    yearstart = extract_year(all_profiles["profiles"][-1]["metadata"]["dem_name"])
+    yearend = extract_year(all_profiles["profiles"][0]["metadata"]["dem_name"])
 
     # Define output name
     output_path = OUTPUT_DIR
@@ -671,25 +723,25 @@ def plot_combined_profiles(all_profiles, coreg_mode='none',
     return output_name
 
 
-def plot_heatmap(all_profiles, reference_year=None, lake_name=None, output_path=None):
+def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, lake_name=None, output_path=None):
     """Create a heatmap showing elevation changes relative to a reference DEM.
     Red = higher than reference, Blue = lower than reference (drainage).
     
     Parameters
     ----------
     all_profiles : dict
-        Dictionary containing elevation profiles
+        Profile data
     reference_year : int, optional
-        Year to use as reference profile (if None, uses oldest DEM)
+        Year to use as reference (default: oldest)
     lake_name : str, optional
-        Name of the lake for plot labeling
+        Name for title
     output_path : str, optional
-        Path to save the plot
-
+        Output directory override
+        
     Returns
     -------
     str
-        Path to the saved heatmap image
+        Path to saved plot
     """
     if not all_profiles["profiles"]:
         raise ValueError("No profile data available for plotting")
@@ -703,7 +755,7 @@ def plot_heatmap(all_profiles, reference_year=None, lake_name=None, output_path=
     for profile in profiles_sorted:
         profvalues = np.array(profile["profile_values"])
         valid_percentage = np.sum(~np.isnan(profvalues)) / len(profvalues)
-        if valid_percentage > 0.5:  # Keep if more than 50% valid data
+        if valid_percentage > 0.5:
             valid_profiles.append(profile)
         else:
             print(f"  ⚠️ Excluding failed transect: {extract_date_label(profile['metadata']['dem_name'])} "
@@ -732,10 +784,7 @@ def plot_heatmap(all_profiles, reference_year=None, lake_name=None, output_path=
     
     for profile in profiles_sorted:
         profvalues = np.array(profile["profile_values"])
-        # Calculate difference from reference
         diff = profvalues - ref_values
-        
-        # Mask out NaN values
         diff = np.ma.masked_invalid(diff)
         
         diff_matrix.append(diff)
@@ -744,28 +793,25 @@ def plot_heatmap(all_profiles, reference_year=None, lake_name=None, output_path=
     
     diff_matrix = np.array(diff_matrix)
     
-    # Create figure with 2 subplots (heatmap + time series)
+    # Create figure with 2 subplots
     fig = plt.figure(figsize=(14, 10))
-    gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.25)
+    gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.3)
     
     # HEATMAP
     ax1 = fig.add_subplot(gs[0])
     
-    # Set symmetric color limits around zero to show both positive and negative changes
     max_abs_diff = np.nanmax(np.abs(diff_matrix))
-    vlim = max(5, max_abs_diff)  # At least 5 meters range
+    vlim = max(5, max_abs_diff)
     
-    # Use RdBu_r colormap (red for higher, blue for lower than reference)
-    # RdBu_r: Red = higher elevation, Blue = lower elevation (drainage)
     im = ax1.imshow(diff_matrix, aspect='auto', cmap='RdBu_r', 
                    extent=[0, transect_km[-1], len(dates)-0.5, -0.5],
                    vmin=-vlim, vmax=vlim, interpolation='nearest')
     
-    # Customize heatmap
-    # If there are many profiles, show only every every 3rd date label to avoid clutter:
+    # Customize heatmap y-axis with dates
     if len(dates) > 10:
-        ax1.set_yticks(range(0, len(dates), 3))
-        ax1.set_yticklabels([dates[i] for i in range(0, len(dates), 3)], fontsize=9)
+        tick_positions = range(0, len(dates), 3)
+        ax1.set_yticks(tick_positions)
+        ax1.set_yticklabels([dates[i] for i in tick_positions], fontsize=9)
     else:
         ax1.set_yticks(range(len(dates)))
         ax1.set_yticklabels(dates, fontsize=9)
@@ -775,106 +821,472 @@ def plot_heatmap(all_profiles, reference_year=None, lake_name=None, output_path=
     ax1.set_title(f'Elevation Change Relative to {reference_date}\n(Red = Higher, Blue = Lower)', 
                  fontsize=12, pad=12)
     
-    # Add colorbar
     cbar = plt.colorbar(im, ax=ax1, label='Elevation Change (m)', fraction=0.05, pad=0.02)
     
-    # Mark reference line
+    # Mark reference line - improved positioning
     ref_idx = profiles_sorted.index(reference_profile)
-    ax1.axhline(y=ref_idx, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
-    ax1.text(transect_km[-1] * 0.98, ref_idx, ' Reference', fontsize=8, 
-            color='black', va='center', fontweight='bold')
+    ax1.axhline(y=ref_idx, color='black', linestyle='--', linewidth=2, alpha=0.8)
     
-    # Add gridlines for better readability
-    ax1.set_xticks(np.arange(0, transect_km[-1] + 0.5, 0.5))
+    # Place "Reference" text INSIDE the plot area, not over the line
+    ax1.text(transect_km[-1] * 0.02,  # 2% from left edge
+             ref_idx + 0.3,            # Slightly above the line
+             'Reference DEM', 
+             fontsize=11,
+             fontweight='bold',
+             color='black',
+             va='bottom',
+             ha='left',
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                      edgecolor='black', alpha=0.8))
+    
+    # Add gridlines
     ax1.grid(True, which='both', axis='both', linestyle=':', linewidth=0.3, alpha=0.5, color='gray')
     
     # TIME SERIES PLOT (Mean elevation change over time)
     ax2 = fig.add_subplot(gs[1])
     
-    # Calculate mean change for each profile (excluding NaN)
     mean_changes = [np.nanmean(diff) for diff in diff_matrix]
     
-    # Plot with color coding (red for positive, blue for negative)
     for i, (year, mean_change) in enumerate(zip(years, mean_changes)):
         color = 'red' if mean_change > 0 else 'blue' if mean_change < 0 else 'gray'
-        alpha = 0.7
         marker = 'o'
         markersize = 6
         
-        # Highlight large negative changes (potential drainage events)
         if mean_change < -2:
             marker = 's'
             markersize = 8
             color = 'darkred'
         
         ax2.plot(i, mean_change, color=color, marker=marker, markersize=markersize, 
-                alpha=alpha, linestyle='none')
+                alpha=0.7, linestyle='none')
     
     # Connect points with line
     ax2.plot(range(len(mean_changes)), mean_changes, 'k-', linewidth=1, alpha=0.3)
     
-    # Add zero line
+    # Zero line
     ax2.axhline(y=0, color='black', linestyle='--', linewidth=1.5, alpha=0.5)
     
-    # Add horizontal bands for significance
-    if len(mean_changes) > 3:
-        # Calculate standard deviation of pre-reference period
-        pre_ref_indices = [i for i, y in enumerate(years) if y < years[ref_idx]]
-        if pre_ref_indices:
-            pre_ref_changes = [mean_changes[i] for i in pre_ref_indices]
-            std_pre_ref = np.nanstd(pre_ref_changes)
-            ax2.fill_between([-0.5, len(mean_changes)-0.5], -std_pre_ref, std_pre_ref, 
-                            alpha=0.15, color='gray', label=f'±1σ (pre-reference)')
-    
-    # Format time series plot
-    # If there are many profiles, show only every 3rd date label to avoid clutter:
+    # Format time series x-axis with dates
     if len(dates) > 10:
-        ax2.set_xticks(range(0, len(dates), 3))
-        ax2.set_xticklabels([dates[i] for i in range(0, len(dates), 3)], rotation=45, ha='right', fontsize=8)
+        tick_positions = range(0, len(dates), 3)
+        ax2.set_xticks(tick_positions)
+        ax2.set_xticklabels([dates[i] for i in tick_positions], rotation=45, ha='right', fontsize=8)
     else:
         ax2.set_xticks(range(len(dates)))
         ax2.set_xticklabels(dates, rotation=45, ha='right', fontsize=8)
+    
     ax2.set_ylabel('Mean Change (m)', fontsize=12)
     ax2.set_xlabel('Date', fontsize=12)
     ax2.grid(True, linestyle=':', linewidth=0.5, alpha=0.7)
     ax2.set_title('Mean Elevation Change Along Transect', fontsize=11, pad=10)
-    ax2.legend(loc='best', fontsize=8)
     
-    # Add drainage annotation if large drop detected
-    if len(mean_changes) > 1:
-        drops = [i for i in range(1, len(mean_changes)) 
-                if mean_changes[i] - mean_changes[i-1] < -2]
-        for drop_idx in drops:
-            ax2.axvline(x=drop_idx, color='red', linestyle=':', alpha=0.5, linewidth=1)
-            ax1.axhline(y=drop_idx, color='red', linestyle=':', alpha=0.3, linewidth=0.5)
+    # Mark reference point in time series
+    ax2.axvline(x=ref_idx, color='black', linestyle='--', linewidth=1.5, alpha=0.5)
+    ax2.text(ref_idx + 0.3, ax2.get_ylim()[1] * 0.95, 'Reference', 
+            fontsize=9, fontweight='bold', va='top', ha='left',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
     
-    # Main title
-    title_text = f'Elevation Change Heatmap'
+    # Title
+    title_text = 'Elevation Change Heatmap'
     if lake_name:
         title_text = f'{lake_name} - {title_text}'
-    
     fig.suptitle(title_text, fontsize=14, fontweight='bold', y=0.98)
     
-    plt.tight_layout()
+    # Use subplots_adjust instead of tight_layout to avoid warning
+    fig.subplots_adjust(left=0.1, right=0.95, top=0.94, bottom=0.08)
     
     # Save if output_path provided
-    if output_path:
-        coords = all_profiles.get("transect_coords", ((0,0), (0,0)))
-        xs, ys = coords[0] if len(coords) > 0 else (0, 0)
-        xe, ye = coords[1] if len(coords) > 1 else (0, 0)
-        
-        output_name = os.path.join(output_path, "transects_combined", 
-                                  f"diff_heatmap_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}.png")
-        os.makedirs(os.path.dirname(output_name), exist_ok=True)
-        fig.savefig(output_name, dpi=150, bbox_inches="tight")
-        print(f"Heatmap saved to: {output_name}")
+    if output_path is None:
+        from config import OUTPUT_DIR
+        output_path = OUTPUT_DIR
     
-    plt.show()
-    return fig
+    coords = all_profiles.get("transect_coords", ((0, 0), (0, 0)))
+    xs, ys = coords[0]
+    xe, ye = coords[1]
+    output_name = os.path.join(output_path, "transects_combined",
+        f"diff_heatmap_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}.png")
+    os.makedirs(os.path.dirname(output_name), exist_ok=True)
 
+    yearstart = extract_year(all_profiles["profiles"][-1]["metadata"]["dem_name"])
+    yearend = extract_year(all_profiles["profiles"][0]["metadata"]["dem_name"])
+
+    if lake_name is not None:
+        output_name = os.path.join(output_path, "transects_combined", 
+                                  f"heatmap_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+    else:
+        output_name = os.path.join(output_path, "transects_combined", 
+                                  f"heatmap_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+
+    fig.savefig(output_name, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Heatmap saved to: {output_name}")
+    
+    return output_name
+
+
+
+# def plot_heatmap(all_profiles, coreg_mode=None, reference_year=None, lake_name=None, output_path=None):
+#     """Create a heatmap showing elevation changes relative to a reference DEM.
+#     Red = higher than reference, Blue = lower than reference (drainage).
+    
+#     Parameters
+#     ----------
+#     all_profiles : dict
+#         Dictionary containing elevation profiles
+#     coreg_mode : str, optional
+#         Coregistration mode for filename suffix
+#     reference_year : int, optional
+#         Year to use as reference profile (if None, uses oldest DEM)
+#     lake_name : str, optional
+#         Name of the lake for plot labeling
+#     output_path : str, optional
+#         Path to save the plot
+
+#     Returns
+#     -------
+#     str
+#         Path to the saved heatmap image
+#     """
+#     if not all_profiles["profiles"]:
+#         raise ValueError("No profile data available for plotting")
+    
+#     # Sort profiles by date
+#     profiles_sorted = sorted(all_profiles["profiles"], 
+#                             key=lambda x: extract_date_obj(x["metadata"]["dem_name"]))
+    
+#     # Filter out failed transects (those with mostly NaN values)
+#     valid_profiles = []
+#     for profile in profiles_sorted:
+#         profvalues = np.array(profile["profile_values"])
+#         valid_percentage = np.sum(~np.isnan(profvalues)) / len(profvalues)
+#         if valid_percentage > 0.5:  # Keep if more than 50% valid data
+#             valid_profiles.append(profile)
+#         else:
+#             print(f"  ⚠️ Excluding failed transect: {extract_date_label(profile['metadata']['dem_name'])} "
+#                   f"(only {valid_percentage:.1%} valid data)")
+    
+#     if not valid_profiles:
+#         raise ValueError("No valid profiles after filtering")
+    
+#     profiles_sorted = valid_profiles
+    
+#     # Select reference profile (oldest by default)
+#     if reference_year is None:
+#         reference_profile = profiles_sorted[0]
+#     else:
+#         reference_profile = min(profiles_sorted, 
+#                                key=lambda x: abs(extract_year(x["metadata"]["dem_name"]) - reference_year))
+    
+#     reference_date = extract_date_label(reference_profile["metadata"]["dem_name"])
+#     ref_values = np.array(reference_profile["profile_values"])
+#     transect_km = reference_profile["transect"] / 1000
+    
+#     # Create difference matrix
+#     diff_matrix = []
+#     dates = []
+#     years = []
+    
+#     for profile in profiles_sorted:
+#         profvalues = np.array(profile["profile_values"])
+#         # Calculate difference from reference
+#         diff = profvalues - ref_values
+        
+#         # Mask out NaN values
+#         diff = np.ma.masked_invalid(diff)
+        
+#         diff_matrix.append(diff)
+#         dates.append(extract_date_label(profile["metadata"]["dem_name"]))
+#         years.append(extract_year(profile["metadata"]["dem_name"]))
+    
+#     diff_matrix = np.array(diff_matrix)
+    
+#     # Create figure with 2 subplots (heatmap + time series)
+#     fig = plt.figure(figsize=(14, 10))
+#     gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.25)
+    
+#     # HEATMAP
+#     ax1 = fig.add_subplot(gs[0])
+    
+#     # Set symmetric color limits around zero to show both positive and negative changes
+#     max_abs_diff = np.nanmax(np.abs(diff_matrix))
+#     vlim = max(5, max_abs_diff)  # At least 5 meters range
+    
+#     # Use RdBu_r colormap (red for higher, blue for lower than reference)
+#     # RdBu_r: Red = higher elevation, Blue = lower elevation (drainage)
+#     im = ax1.imshow(diff_matrix, aspect='auto', cmap='RdBu_r', 
+#                    extent=[0, transect_km[-1], len(dates)-0.5, -0.5],
+#                    vmin=-vlim, vmax=vlim, interpolation='nearest')
+    
+#     # Customize heatmap
+#     # If there are many profiles, show only every every 3rd date label to avoid clutter:
+#     if len(dates) > 10:
+#         ax1.set_yticks(range(0, len(dates), 3))
+#         ax1.set_yticklabels([dates[i] for i in range(0, len(dates), 3)], fontsize=9)
+#     else:
+#         ax1.set_yticks(range(len(dates)))
+#         ax1.set_yticklabels(dates, fontsize=9)
+
+#     ax1.set_ylabel('Date', fontsize=12)
+#     ax1.set_xlabel('Distance along transect (km)', fontsize=12)
+#     ax1.set_title(f'Elevation Change Relative to {reference_date}\n(Red = Higher, Blue = Lower)', 
+#                  fontsize=12, pad=12)
+    
+#     # Add colorbar
+#     cbar = plt.colorbar(im, ax=ax1, label='Elevation Change (m)', fraction=0.05, pad=0.02)
+    
+#     # Mark reference line
+#     ref_idx = profiles_sorted.index(reference_profile)
+#     ax1.axhline(y=ref_idx, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
+#     ax1.text(transect_km[-1] * 0.98, ref_idx, ' Reference', fontsize=8, 
+#             color='black', va='center', fontweight='bold')
+    
+#     # Add gridlines for better readability
+#     ax1.set_xticks(np.arange(0, transect_km[-1] + 0.5, 0.5))
+#     ax1.grid(True, which='both', axis='both', linestyle=':', linewidth=0.3, alpha=0.5, color='gray')
+    
+#     # TIME SERIES PLOT (Mean elevation change over time)
+#     ax2 = fig.add_subplot(gs[1])
+    
+#     # Calculate mean change for each profile (excluding NaN)
+#     mean_changes = [np.nanmean(diff) for diff in diff_matrix]
+    
+#     # Plot with color coding (red for positive, blue for negative)
+#     for i, (year, mean_change) in enumerate(zip(years, mean_changes)):
+#         color = 'red' if mean_change > 0 else 'blue' if mean_change < 0 else 'gray'
+#         alpha = 0.7
+#         marker = 'o'
+#         markersize = 6
+        
+#         # Highlight large negative changes (potential drainage events)
+#         if mean_change < -2:
+#             marker = 's'
+#             markersize = 8
+#             color = 'darkred'
+        
+#         ax2.plot(i, mean_change, color=color, marker=marker, markersize=markersize, 
+#                 alpha=alpha, linestyle='none')
+    
+#     # Connect points with line
+#     ax2.plot(range(len(mean_changes)), mean_changes, 'k-', linewidth=1, alpha=0.3)
+    
+#     # Add zero line
+#     ax2.axhline(y=0, color='black', linestyle='--', linewidth=1.5, alpha=0.5)
+    
+#     # Add horizontal bands for significance
+#     if len(mean_changes) > 3:
+#         # Calculate standard deviation of pre-reference period
+#         pre_ref_indices = [i for i, y in enumerate(years) if y < years[ref_idx]]
+#         if pre_ref_indices:
+#             pre_ref_changes = [mean_changes[i] for i in pre_ref_indices]
+#             std_pre_ref = np.nanstd(pre_ref_changes)
+#             ax2.fill_between([-0.5, len(mean_changes)-0.5], -std_pre_ref, std_pre_ref, 
+#                             alpha=0.15, color='gray', label=f'±1σ (pre-reference)')
+    
+#     # Format time series plot
+#     # If there are many profiles, show only every 3rd date label to avoid clutter:
+#     if len(dates) > 10:
+#         ax2.set_xticks(range(0, len(dates), 3))
+#         ax2.set_xticklabels([dates[i] for i in range(0, len(dates), 3)], rotation=45, ha='right', fontsize=8)
+#     else:
+#         ax2.set_xticks(range(len(dates)))
+#         ax2.set_xticklabels(dates, rotation=45, ha='right', fontsize=8)
+#     ax2.set_ylabel('Mean Change (m)', fontsize=12)
+#     ax2.set_xlabel('Date', fontsize=12)
+#     ax2.grid(True, linestyle=':', linewidth=0.5, alpha=0.7)
+#     ax2.set_title('Mean Elevation Change Along Transect', fontsize=11, pad=10)
+#     ax2.legend(loc='best', fontsize=8)
+    
+#     # Add drainage annotation if large drop detected
+#     if len(mean_changes) > 1:
+#         drops = [i for i in range(1, len(mean_changes)) 
+#                 if mean_changes[i] - mean_changes[i-1] < -2]
+#         for drop_idx in drops:
+#             ax2.axvline(x=drop_idx, color='red', linestyle=':', alpha=0.5, linewidth=1)
+#             ax1.axhline(y=drop_idx, color='red', linestyle=':', alpha=0.3, linewidth=0.5)
+    
+#     # Main title
+#     title_text = f'Elevation Change Heatmap'
+#     if lake_name:
+#         title_text = f'{lake_name} - {title_text}'
+    
+#     fig.suptitle(title_text, fontsize=14, fontweight='bold', y=0.98)
+    
+#     plt.tight_layout()
+    
+#     # Save if output_path provided
+#     if output_path:
+#         coords = all_profiles.get("transect_coords", ((0,0), (0,0)))
+#         xs, ys = coords[0] if len(coords) > 0 else (0, 0)
+#         xe, ye = coords[1] if len(coords) > 1 else (0, 0)
+        
+#         output_name = os.path.join(output_path, "transects_combined", 
+#                                   f"diff_heatmap_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}.png")
+#         os.makedirs(os.path.dirname(output_name), exist_ok=True)
+#         fig.savefig(output_name, dpi=150, bbox_inches="tight")
+#         print(f"Heatmap saved to: {output_name}")
+    
+#     plt.show()
+#     return fig
+
+
+# def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_path=None):
+#     """Create original-style plot alongside difference plot.
+    
+#     Parameters    
+#     ----------
+#     all_profiles : dict
+#         Dictionary containing elevation profiles
+#     coreg_mode : str
+#         Coregistration mode for filename suffix
+#     lake_name : str, optional
+#         Name of the lake for plot labeling
+#     output_path : str, optional
+#         Path to save the plot
+    
+#     Returns
+#     -------
+#     str
+#         Path to the saved plot
+#     """
+#     if not all_profiles["profiles"]:
+#         raise ValueError("No profile data available for plotting")
+    
+#     # Sort profiles by date
+#     profiles_sorted = sorted(all_profiles["profiles"], 
+#                             key=lambda x: extract_date_obj(x["metadata"]["dem_name"]))
+    
+#     # Use the oldest as reference
+#     reference_profile = profiles_sorted[0]
+#     reference_path = reference_profile["metadata"]["path"]
+#     reference_date = extract_date_label(reference_profile["metadata"]["dem_name"])
+#     ref_values = np.array(reference_profile["profile_values"])
+#     transect_m = reference_profile["transect"]
+    
+#     # Create figure with 2 subplots side by side
+#     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+    
+#     # LEFT PLOT: Original-style absolute elevations with viridis
+#     n_profiles = len(profiles_sorted)
+#     colors = plt.cm.viridis(np.linspace(0, 1, n_profiles))
+    
+#     for i, profile in enumerate(profiles_sorted):
+#         date_label = extract_date_label(profile["metadata"]["dem_name"])
+#         profvalues = np.array(profile["profile_values"])
+#         valid_mask = ~np.isnan(profvalues)
+        
+#         if np.any(valid_mask):
+#             # Check if this is reference profile by comparing paths
+#             is_reference = (profile["metadata"]["path"] == reference_path)
+#             linewidth = 3 if is_reference else 1.5
+#             linestyle = '--' if is_reference else '-'
+#             alpha = 1.0 if is_reference else 0.7
+            
+#             ax1.plot(transect_m[valid_mask], profvalues[valid_mask], 
+#                     color=colors[i], linewidth=linewidth, alpha=alpha, 
+#                     linestyle=linestyle, label=date_label if not is_reference else f'Reference ({date_label})')
+    
+#     ax1.set_xlabel('Distance along transect (m)', fontsize=12)
+#     ax1.set_ylabel('Elevation (m)', fontsize=12)
+#     ax1.grid(True, linestyle=':', linewidth=0.5, alpha=0.7)
+#     # If there are many profiles, make a subsample for the legend of 10 elements:
+#     if len(all_profiles["profiles"]) > 10:
+#         handles, labels = ax1.get_legend_handles_labels()
+#         step = max(1, len(handles) // 10)
+#         ax1.legend(handles[::step], labels[::step], bbox_to_anchor=(1.02, 1), fontsize=8, loc="best",
+#                 frameon=True, fancybox=True, shadow=True)
+#     else:
+#         ax1.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8, 
+#                 frameon=True, fancybox=True, shadow=True)
+
+#     ax1.set_title(f'Elevation Profiles (viridis colormap)', fontsize=12, pad=12)
+    
+#     # RIGHT PLOT: Difference plot
+#     for profile in profiles_sorted:
+#         # Skip reference profile by comparing paths
+#         if profile["metadata"]["path"] == reference_path:
+#             continue
+            
+#         date_label = extract_date_label(profile["metadata"]["dem_name"])
+#         profvalues = np.array(profile["profile_values"])
+#         valid_mask = ~np.isnan(profvalues) & ~np.isnan(ref_values)
+        
+#         if np.any(valid_mask):
+#             elevation_diff = profvalues[valid_mask] - ref_values[valid_mask]
+#             year = extract_year(profile["metadata"]["dem_name"])
+            
+#             if year < extract_year(reference_profile["metadata"]["dem_name"]):
+#                 color = 'lightcoral'
+#             else:
+#                 # Blue intensity increases with time
+#                 year_diff = min(year - extract_year(reference_profile["metadata"]["dem_name"]), 10)
+#                 blue_intensity = 0.4 + (year_diff / 10) * 0.5
+#                 color = plt.cm.viridis(blue_intensity)
+            
+#             ax2.plot(transect_m[valid_mask], elevation_diff, 
+#                     color=color, linewidth=1.5, alpha=0.7, label=date_label)
+    
+#     ax2.axhline(y=0, color='black', linestyle='-', linewidth=1.5, alpha=0.5)
+#     ax2.set_xlabel('Distance along transect (m)', fontsize=12)
+#     ax2.set_ylabel('Elevation Change (m)', fontsize=12)
+#     ax2.grid(True, linestyle=':', linewidth=0.5, alpha=0.7)
+
+#     # If there are many profiles, make a subsample for the legend of 10 elements:
+#     if len(all_profiles["profiles"]) > 10:
+#         handles, labels = ax2.get_legend_handles_labels()
+#         step = max(1, len(handles) // 10)
+#         ax2.legend(handles[::step], labels[::step], bbox_to_anchor=(1.02, 1), fontsize=8, loc="best",
+#                 frameon=True, fancybox=True, shadow=True)
+#     else:
+#         ax2.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8, 
+#                 frameon=True, fancybox=True, shadow=True)
+
+#     ax2.set_title(f'Change Relative to {reference_date}', fontsize=12, pad=12)
+    
+#     # Add A/B markers
+#     first_valid_profile = next((p for p in profiles_sorted if np.any(~np.isnan(p["profile_values"]))), None)
+#     if first_valid_profile:
+#         first_values = np.array(first_valid_profile["profile_values"])
+#         first_valid_mask = ~np.isnan(first_values)
+#         if np.any(first_valid_mask):
+#             ax1.annotate('A', xy=(transect_m[0], first_values[first_valid_mask][0]), 
+#                         xytext=(0.0, 1.01), textcoords='axes fraction', 
+#                         color='red', fontsize=13, fontweight='bold')
+#             ax1.annotate('B', xy=(transect_m[-1], first_values[first_valid_mask][-1]), 
+#                         xytext=(1.0, 1.01), textcoords='axes fraction', ha='right',
+#                         color='blue', fontsize=13, fontweight='bold')
+            
+#             ax2.annotate('A', xy=(transect_m[0], 0), xytext=(0.0, 1.01), 
+#                         textcoords='axes fraction', color='red', fontsize=13, fontweight='bold')
+#             ax2.annotate('B', xy=(transect_m[-1], 0), xytext=(1.0, 1.01), 
+#                         textcoords='axes fraction', ha='right', color='blue', 
+#                         fontsize=13, fontweight='bold')
+    
+#     # Main title
+#     date_start = extract_date_label(profiles_sorted[0]["metadata"]["dem_name"])
+#     date_end = extract_date_label(profiles_sorted[-1]["metadata"]["dem_name"])
+#     title_text = f'Elevation Analysis: {date_start} - {date_end}'
+#     if lake_name:
+#         title_text = f'{lake_name} - {title_text}'
+    
+#     fig.suptitle(title_text, fontsize=14, fontweight='bold', y=1.02)
+    
+#     plt.tight_layout()
+    
+#     if output_path:
+#         coords = all_profiles.get("transect_coords", ((0,0), (0,0)))
+#         xs, ys = coords[0] if len(coords) > 0 else (0, 0)
+#         xe, ye = coords[1] if len(coords) > 1 else (0, 0)
+#         output_name = os.path.join(output_path, "transects_combined", 
+#                                   f"profile_diff_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}_{coreg_mode}.png")
+#         os.makedirs(os.path.dirname(output_name), exist_ok=True)
+#         fig.savefig(output_name, dpi=150, bbox_inches="tight")
+#         print(f"Plot saved to: {output_name}")
+    
+#     plt.show()
+#     return fig
 
 def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_path=None):
-    """Create original-style plot alongside difference plot.
+    """Plot elevation changes relative to the oldest DEM (reference).
     
     Parameters    
     ----------
@@ -906,47 +1318,11 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
     ref_values = np.array(reference_profile["profile_values"])
     transect_m = reference_profile["transect"]
     
-    # Create figure with 2 subplots side by side
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+    # Create figure with single plot
+    fig, ax = plt.subplots(figsize=(14, 7))
     
-    # LEFT PLOT: Original-style absolute elevations with viridis
-    n_profiles = len(profiles_sorted)
-    colors = plt.cm.viridis(np.linspace(0, 1, n_profiles))
-    
-    for i, profile in enumerate(profiles_sorted):
-        date_label = extract_date_label(profile["metadata"]["dem_name"])
-        profvalues = np.array(profile["profile_values"])
-        valid_mask = ~np.isnan(profvalues)
-        
-        if np.any(valid_mask):
-            # Check if this is reference profile by comparing paths
-            is_reference = (profile["metadata"]["path"] == reference_path)
-            linewidth = 3 if is_reference else 1.5
-            linestyle = '--' if is_reference else '-'
-            alpha = 1.0 if is_reference else 0.7
-            
-            ax1.plot(transect_m[valid_mask], profvalues[valid_mask], 
-                    color=colors[i], linewidth=linewidth, alpha=alpha, 
-                    linestyle=linestyle, label=date_label if not is_reference else f'Reference ({date_label})')
-    
-    ax1.set_xlabel('Distance along transect (m)', fontsize=12)
-    ax1.set_ylabel('Elevation (m)', fontsize=12)
-    ax1.grid(True, linestyle=':', linewidth=0.5, alpha=0.7)
-    # If there are many profiles, make a subsample for the legend of 10 elements:
-    if len(all_profiles["profiles"]) > 10:
-        handles, labels = ax1.get_legend_handles_labels()
-        step = max(1, len(handles) // 10)
-        ax1.legend(handles[::step], labels[::step], bbox_to_anchor=(1.02, 1), fontsize=8, loc="best",
-                frameon=True, fancybox=True, shadow=True)
-    else:
-        ax1.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8, 
-                frameon=True, fancybox=True, shadow=True)
-
-    ax1.set_title(f'Elevation Profiles (viridis colormap)', fontsize=12, pad=12)
-    
-    # RIGHT PLOT: Difference plot
+    # Plot difference for each profile (skip reference)
     for profile in profiles_sorted:
-        # Skip reference profile by comparing paths
         if profile["metadata"]["path"] == reference_path:
             continue
             
@@ -957,84 +1333,103 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
         if np.any(valid_mask):
             elevation_diff = profvalues[valid_mask] - ref_values[valid_mask]
             year = extract_year(profile["metadata"]["dem_name"])
+            ref_year = extract_year(reference_profile["metadata"]["dem_name"])
             
-            if year < extract_year(reference_profile["metadata"]["dem_name"]):
+            if year < ref_year:
                 color = 'lightcoral'
+                alpha = 0.6
+                linewidth = 1.2
             else:
-                # Blue intensity increases with time
-                year_diff = min(year - extract_year(reference_profile["metadata"]["dem_name"]), 10)
+                # Blue intensity increases with time from reference
+                year_diff = min(year - ref_year, 10)
                 blue_intensity = 0.4 + (year_diff / 10) * 0.5
                 color = plt.cm.viridis(blue_intensity)
+                alpha = 0.7
+                linewidth = 1.5
             
-            ax2.plot(transect_m[valid_mask], elevation_diff, 
-                    color=color, linewidth=1.5, alpha=0.7, label=date_label)
+            ax.plot(transect_m[valid_mask], elevation_diff, 
+                    color=color, linewidth=linewidth, alpha=alpha, label=date_label)
     
-    ax2.axhline(y=0, color='black', linestyle='-', linewidth=1.5, alpha=0.5)
-    ax2.set_xlabel('Distance along transect (m)', fontsize=12)
-    ax2.set_ylabel('Elevation Change (m)', fontsize=12)
-    ax2.grid(True, linestyle=':', linewidth=0.5, alpha=0.7)
-
-    # If there are many profiles, make a subsample for the legend of 10 elements:
-    if len(all_profiles["profiles"]) > 10:
-        handles, labels = ax2.get_legend_handles_labels()
-        step = max(1, len(handles) // 10)
-        ax2.legend(handles[::step], labels[::step], bbox_to_anchor=(1.02, 1), fontsize=8, loc="best",
-                frameon=True, fancybox=True, shadow=True)
-    else:
-        ax2.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8, 
-                frameon=True, fancybox=True, shadow=True)
-
-    ax2.set_title(f'Change Relative to {reference_date}', fontsize=12, pad=12)
+    # Zero line (no change from reference)
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=1.8, alpha=0.7, zorder=1)
     
-    # Add A/B markers
-    first_valid_profile = next((p for p in profiles_sorted if np.any(~np.isnan(p["profile_values"]))), None)
-    if first_valid_profile:
-        first_values = np.array(first_valid_profile["profile_values"])
-        first_valid_mask = ~np.isnan(first_values)
-        if np.any(first_valid_mask):
-            ax1.annotate('A', xy=(transect_m[0], first_values[first_valid_mask][0]), 
-                        xytext=(0.0, 1.01), textcoords='axes fraction', 
-                        color='red', fontsize=13, fontweight='bold')
-            ax1.annotate('B', xy=(transect_m[-1], first_values[first_valid_mask][-1]), 
-                        xytext=(1.0, 1.01), textcoords='axes fraction', ha='right',
-                        color='blue', fontsize=13, fontweight='bold')
-            
-            ax2.annotate('A', xy=(transect_m[0], 0), xytext=(0.0, 1.01), 
-                        textcoords='axes fraction', color='red', fontsize=13, fontweight='bold')
-            ax2.annotate('B', xy=(transect_m[-1], 0), xytext=(1.0, 1.01), 
-                        textcoords='axes fraction', ha='right', color='blue', 
-                        fontsize=13, fontweight='bold')
+    # Format plot
+    ax.set_xlabel('Distance along transect (m)', fontsize=12)
+    ax.set_ylabel('Elevation Change (m)', fontsize=12)
+    ax.grid(True, linestyle=':', linewidth=0.5, alpha=0.7)
     
-    # Main title
+    # Legend - only show if there are labeled artists
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        n_profiles = len(profiles_sorted) - 1  # Excluding reference
+        if n_profiles > 10:
+            step = max(1, n_profiles // 10)
+            ax.legend(handles[::step], labels[::step], fontsize=8, loc='best',
+                    frameon=True, fancybox=True, shadow=True)
+        else:
+            ax.legend(loc='best', fontsize=8, frameon=True, fancybox=True, shadow=True)
+    
+    # Add A/B markers at start and end of transect
+    ax.annotate('A', xy=(transect_m[0], 0), xytext=(0.0, 1.01), 
+                textcoords='axes fraction', color='red', fontsize=13, fontweight='bold')
+    ax.annotate('B', xy=(transect_m[-1], 0), xytext=(1.0, 1.01), 
+                textcoords='axes fraction', ha='right', color='blue', 
+                fontsize=13, fontweight='bold')
+    
+    # Title with date range
     date_start = extract_date_label(profiles_sorted[0]["metadata"]["dem_name"])
     date_end = extract_date_label(profiles_sorted[-1]["metadata"]["dem_name"])
-    title_text = f'Elevation Analysis: {date_start} - {date_end}'
+    
+    title_text = f'Elevation Change Relative to {reference_date}\n{date_start} – {date_end}'
     if lake_name:
-        title_text = f'{lake_name} - {title_text}'
+        title_text = f'{lake_name} — {title_text}'
     
-    fig.suptitle(title_text, fontsize=14, fontweight='bold', y=1.02)
+    ax.set_title(title_text, fontsize=14, fontweight='bold', pad=15)
     
-    plt.tight_layout()
+    # Add annotation explaining colors
+    annotation_text = (
+        f"Reference: {reference_date}\n"
+        f"Red tones = pre-reference\n"
+        f"Blue tones = post-reference\n"
+        f"(darker = further from reference)"
+    )
+    ax.text(0.02, 0.98, annotation_text, transform=ax.transAxes,
+            fontsize=8, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
+    # Use figure-level layout adjustment instead of tight_layout
+    fig.subplots_adjust(left=0.08, right=0.92, top=0.92, bottom=0.1)
+    
+    # Save if output path provided
     if output_path:
-        coords = all_profiles.get("transect_coords", ((0,0), (0,0)))
+        coords = all_profiles.get("transect_coords", ((0, 0), (0, 0)))
         xs, ys = coords[0] if len(coords) > 0 else (0, 0)
         xe, ye = coords[1] if len(coords) > 1 else (0, 0)
-        output_name = os.path.join(output_path, "transects_combined", 
-                                  f"profile_diff_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}_{coreg_mode}.png")
+            
+        yearstart = extract_year(all_profiles["profiles"][-1]["metadata"]["dem_name"])
+        yearend = extract_year(all_profiles["profiles"][0]["metadata"]["dem_name"])
+
+        if lake_name is not None:
+            output_name = os.path.join(output_path, "transects_combined", 
+                                    f"profile_diff_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+        else:
+            output_name = os.path.join(output_path, "transects_combined", 
+                                    f"profile_diff_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
         os.makedirs(os.path.dirname(output_name), exist_ok=True)
         fig.savefig(output_name, dpi=150, bbox_inches="tight")
         print(f"Plot saved to: {output_name}")
     
     plt.show()
     return fig
+
+
 # ============================================================================
 # MAIN WORKFLOW FUNCTIONS
 # ============================================================================
 
 def run_elevation_history(archdir, output_path=None, coreg_mode='none',
                          coords=None, time_range="2010-01-01/2026-12-31",
-                         window_size=3, window_type='square'):
+                         window_size=3, window_type='square', max_cloud_cover=0.2):
     """
     Complete workflow for elevation history analysis.
     
@@ -1051,6 +1446,8 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     time_range : str
         "YYYY-MM-DD/YYYY-MM-DD"
     window_size, window_type : as in get_elevation_window
+    max_cloud_cover : float
+        Maximum cloud cover fraction for filtering DEMs (default: 0.2)
         
     Returns
     -------
@@ -1076,7 +1473,7 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
             coords[0] + 0.001, coords[1] + 0.001)
     
     items_gdf, items = search_arcticdem_strips(bbox, time_range)
-    items_gdf = filter_strip_dems(items_gdf, max_cloud_cover=0.2)
+    items_gdf = filter_strip_dems(items_gdf, max_cloud_cover=max_cloud_cover)
     
     pairnames, geocells, dates = get_dem_metadata(items_gdf)
     
@@ -1124,7 +1521,7 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
 
 def run_transect_analysis(archdir, output_path=None, coreg_mode='none',
                          transect_coords=None, time_range="2011-01-01/2026-12-31",
-                         max_dems=18, lake_name=None):
+                         max_dems=18, lake_name=None, max_cloud_cover=0.2):
     """Complete workflow for transect elevation profile analysis.
     
     Parameters
@@ -1143,7 +1540,9 @@ def run_transect_analysis(archdir, output_path=None, coreg_mode='none',
         Maximum number of DEMs to process
     lake_name : str, optional
         Name for plot titles
-        
+    max_cloud_cover : float
+        Maximum cloud cover fraction for filtering DEMs (default: 0.2)
+
     Returns
     -------
     dict
@@ -1170,7 +1569,7 @@ def run_transect_analysis(archdir, output_path=None, coreg_mode='none',
     bbox = (west, south, east, north)
     
     items_gdf, items = search_arcticdem_strips(bbox, time_range)
-    items_gdf = filter_strip_dems(items_gdf, max_items=max_dems)
+    items_gdf = filter_strip_dems(items_gdf, max_items=max_dems, max_cloud_cover=max_cloud_cover)
     
     pairnames, geocells, dates = get_dem_metadata(items_gdf)
     
@@ -1240,8 +1639,9 @@ def additional_plots(all_profiles, reference_year=None, coreg_mode='none', lake_
     output_path = OUTPUT_DIR
 
     print(f"\n=== Generating elevation change heatmap and relative difference plots ===")
-    output_heatmap = plot_heatmap(all_profiles, reference_year=reference_year, lake_name=lake_name, output_path=output_path)
-    all_profiles['heatmap_path'] = output_heatmap
+    # output_heatmap = plot_heatmap(all_profiles, reference_year=reference_year, lake_name=lake_name, output_path=output_path)
+    output_diff_heatmap = plot_difference_heatmap(all_profiles, reference_year=reference_year, lake_name=lake_name, output_path=output_path)
+    all_profiles['heatmap_path'] = output_diff_heatmap
 
     output_rel_diff = plot_relative_differences(all_profiles, coreg_mode=coreg_mode, lake_name=lake_name, output_path=output_path)
     all_profiles['relative_diff_path'] = output_rel_diff

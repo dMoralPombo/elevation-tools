@@ -8,7 +8,8 @@ Tools for extracting and analyzing elevation profiles and time series from the [
 ## Features
 
 - **Elevation History**: Extract elevation time series at a point across hundreds of DEMs
-- **Transect Profiles** (⚠️ under development): Extract and compare elevation profiles along a transect
+- **Transect Profiles**: Extract and compare elevation profiles along a transect
+- **Differentiation of DEMs**: Computes and visualise elevation differences btween pairs of stripDEMs
 - **Interactive Maps**: Select coordinates using draggable markers on satellite imagery
 - **Window-based Sampling**: Robust elevation extraction using configurable pixel windows
 - **Multiple Coregistration Modes**: Support for raw, altimetry-coregistered, and mosaic-coregistered DEMs
@@ -120,6 +121,46 @@ Window size examples:
 -window_size=5: 5×5 window (25 pixels) or cross of 9 pixels
 
 Larger windows provide more robust elevation estimates with uncertainty (standard deviation).
+
+#### ✅ DEM Difference Analysis (`notebooks/03_dem_difference.ipynb`)
+
+**Status: Not Functional (yet)**
+
+This notebook computes and visualizes elevation differences between pairs of ArcticDEM strips using pre-computed zarr files. Use it to:
+
+1. **Select strip pairs** for comparison
+2. **Compute elevation differences** (newer − older)
+3. **Generate publication-quality difference maps** with:
+   - Dual EPSG:3413 / EPSG:4326 coordinate axes
+   - Statistics box (valid pixels, mean, std, min, max)
+   - Optional shapefile overlay (e.g., lake boundaries)
+   - Automatic cropping to valid data region
+   - Intelligent downsampling for large arrays
+
+**Key parameters:**
+- `TILE`: Tile identifier (e.g., `"31_38_1_1"`)
+- `STRIP_PAIRS`: List of (newer_strip, older_strip) tuples
+- `EXTENT`: Tile bounds in EPSG:3413 meters `(left, bottom, right, top)`
+- `SHP_PATH`: Optional path to shapefile for overlay
+
+**Requirements:**
+- Pre-computed zarr files from the GLOBE processing pipeline
+- Shapefile for overlay (optional)
+
+**Example workflow:**
+```python
+from diff_analysis import run_dem_difference
+
+results = run_dem_difference(
+    tile="31_38_1_1",
+    strip_pairs=[
+        ("strip_2024", "strip_2022"),
+        ("strip_2023", "strip_2021"),
+    ],
+    zarr_dir="/path/to/zarr/files/",
+    extent=(-300000, -1000000, -250000, -950000),
+    shp_path="/path/to/lakes.shp",
+)
 
 ## Limitations
 
