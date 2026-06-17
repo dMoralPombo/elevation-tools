@@ -128,7 +128,8 @@ def process_elevation_history(
     geocells, pairnames, dates, archdir, coords,
     window_size=DEFAULT_WINDOW_SIZE,
     window_type=DEFAULT_WINDOW_TYPE,
-    coreg_mode="none"
+    coreg_mode="none",
+    lake_name=None
 ):
     """Track elevation values at a point across multiple DEMs.
     
@@ -143,6 +144,8 @@ def process_elevation_history(
     window_size, window_type : as in get_elevation_window
     coreg_mode : str
         'none', 'altim', or 'mosaic'
+    lake_name : str, optional
+        Name for plot titles
         
     Returns
     -------
@@ -166,6 +169,7 @@ def process_elevation_history(
         'dates': [], 'pairnames': [], 'metadata': [],
         'coords_4326': coords, 'coords_3413': coords_3413,
         'window_size': window_size, 'window_type': window_type,
+        'lake_name': lake_name
     }
     
     # Build coregistration suffix
@@ -332,7 +336,7 @@ def process_elevation_profiles(
 # VISUALIZATION FUNCTIONS
 # ============================================================================
 
-def plot_elevation_history(history, output_path=None, coreg_mode='none'):
+def plot_elevation_history(history, output_path=None, coreg_mode='none', lake_name=None):
     """Plot elevation time series with error bars.
     
     Parameters
@@ -343,6 +347,8 @@ def plot_elevation_history(history, output_path=None, coreg_mode='none'):
         Path to save plot
     coreg_mode : str
         Coregistration mode for filename
+    lake_name : str, optional
+        Name for plot title and filename
         
     Returns
     -------
@@ -416,9 +422,13 @@ def plot_elevation_history(history, output_path=None, coreg_mode='none'):
     ax.set_xlabel('Date', fontsize=12)
     
     coords = history['coords_4326']
-    ax.set_title(f"Elevation History at ({coords[0]:.3f}°E, {coords[1]:.3f}°N)\n"
-                f"{window_desc} window", fontsize=14, fontweight='bold')
-    
+    if lake_name is None:
+        ax.set_title(f"Elevation History at ({coords[0]:.3f}°E, {coords[1]:.3f}°N)\n"
+                    f"{window_desc} window", fontsize=14, fontweight='bold')
+    else:
+        ax.set_title(f"Elevation History at ({coords[0]:.3f}°E, {coords[1]:.3f}°N)\n"
+                    f"{lake_name} - {window_desc} window", fontsize=14, fontweight='bold')
+
     ax.legend(loc='best', fontsize=9, frameon=True, fancybox=True)
     plt.tight_layout()
     
@@ -428,10 +438,16 @@ def plot_elevation_history(history, output_path=None, coreg_mode='none'):
     #     'elevation_histories',
     #     f"elevation_history_{coords[0]:.3f}_{coords[1]:.3f}_{coreg_mode}_{years}.png"
     # )
-    output_path = os.path.join(
-        output_path if output_path else OUTPUT_DIR,
-        f"elevation_history_{coords[0]:.3f}_{coords[1]:.3f}_{coreg_mode}_{years}.png"
-    )
+    if lake_name is None:
+        output_path = os.path.join(
+            output_path if output_path else OUTPUT_DIR,
+            f"elevation_history_{coords[0]:.3f}_{coords[1]:.3f}_{coreg_mode}_{years}.png"
+        )
+    else:
+        output_path = os.path.join(
+            output_path if output_path else OUTPUT_DIR,
+            f"elevation_history_{lake_name}_{coords[0]:.3f}_{coords[1]:.3f}_{coreg_mode}_{years}.png"
+        )
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Plot saved: {output_path}")
@@ -1429,7 +1445,7 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
 
 def run_elevation_history(archdir, output_path=None, coreg_mode='none',
                          coords=None, time_range="2010-01-01/2026-12-31",
-                         window_size=3, window_type='square', max_cloud_cover=0.2):
+                         window_size=3, window_type='square', max_cloud_cover=0.2, lake_name=None):
     """
     Complete workflow for elevation history analysis.
     
@@ -1448,6 +1464,8 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     window_size, window_type : as in get_elevation_window
     max_cloud_cover : float
         Maximum cloud cover fraction for filtering DEMs (default: 0.2)
+    lake_name : str, optional
+        Name for plot titles
         
     Returns
     -------
@@ -1486,7 +1504,7 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     
     # Plot
     print(f"\nGenerating elevation history plot to {output_path}...")
-    plot_path = plot_elevation_history(history, output_path, coreg_mode)
+    plot_path = plot_elevation_history(history, output_path, coreg_mode, lake_name=lake_name)
     history['plot_path'] = plot_path
     
     # Save data
@@ -1500,10 +1518,16 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     else:
         suf = '_mosaic'
     
-    data_path = get_output_path(
-        'elevation_histories',
-        f"elevation_history_{coords[0]:.3f}_{coords[1]:.3f}{suf}_{year_i}-{year_f}.txt"
-    )
+    if lake_name is None:
+        data_path = get_output_path(
+            'elevation_histories',
+            f"elevation_history_{coords[0]:.3f}_{coords[1]:.3f}{suf}_{year_i}-{year_f}.txt"
+        )
+    else:
+        data_path = get_output_path(
+            'elevation_histories',
+            f"elevation_history_{lake_name}_{coords[0]:.3f}_{coords[1]:.3f}{suf}_{year_i}-{year_f}.txt"
+        )
     
     with open(data_path, 'w') as f:
         f.write(f"Elevation History at ({coords[0]:.3f}, {coords[1]:.3f})\n")
