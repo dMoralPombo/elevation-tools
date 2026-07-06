@@ -306,8 +306,14 @@ def process_elevation_profiles(
             else:
                 raster_path = os.path.join(
                     archdir,
-                    f"{geocell}/SETSM_s2s041_{pairname}_2m_lsf_seg1_dem{suffix}_coregistered.tif"
+                    f"{geocell}/SETSM_s2s041_{pairname}_2m_*_dem{suffix}*_coregistered.tif"
                 )
+                # raster_path should have a wildcard after suffix, so we need to find the actual file
+                raster_files = glob.glob(raster_path)
+                if not raster_files:
+                    print(f"No coregistered files found for {pairname}")
+                    continue
+                raster_path = raster_files[0]
                 dem_name = f"SETSM_{pairname}"
                 transect, elevations, distance, x0, y0, x1, y1 = \
                     extract_elevation_profile(transect_coords, raster_path, num_samples)
@@ -454,8 +460,7 @@ def plot_elevation_history(history, output_path=None, coreg_mode='none', lake_na
     return output_path
 
 
-def plot_combined_profiles(all_profiles, coreg_mode='none', 
-                          cmap='terrain', lake_name=None, margin_km=2):
+def plot_combined_profiles(all_profiles, coreg_mode='none', cmap='terrain', lake_name=None, margin_km=2):
     """Plot elevation profiles from multiple DEMs with reference map.
     
     Parameters
@@ -1475,7 +1480,7 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     from elevation_utils import search_arcticdem_strips, filter_strip_dems, get_dem_metadata
     
     if output_path is None:
-        output_path = OUTPUT_DIR
+        output_path = os.path.join(OUTPUT_DIR, 'elevation_histories')
     
     # Get coordinates if not provided
     if coords is None:
@@ -1512,7 +1517,7 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     year_f = time_range[-10:-6] if '/' in time_range else time_range[-4:]
     
     if coreg_mode == 'none':
-        suf = '_nc'
+        suf = '_none'
     elif coreg_mode == 'altim':
         suf = '_altim'
     else:
@@ -1612,13 +1617,13 @@ def run_transect_analysis(archdir, output_path=None, coreg_mode='none',
     if lake_name:
         data_path = get_output_path(
             'transects_combined',
-            f"combined_profiles_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}_"
+            f"profile_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}_"
             f"{year_start}-{year_end}_{coreg_mode}.txt"
         )
     else:
         data_path = get_output_path(
             'transects_combined',
-            f"combined_profiles_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}_"
+            f"profile_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}_"
             f"{year_start}-{year_end}_{coreg_mode}.txt"
         )
     
