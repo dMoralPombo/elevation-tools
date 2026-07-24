@@ -350,6 +350,7 @@ def get_elevation_window(src, x, y, window_size=DEFAULT_WINDOW_SIZE,
     row, col = src.index(x, y)
     
     if not (0 <= row < src.height and 0 <= col < src.width):
+        print("Row/col out of indexes")
         return np.nan, np.nan, 0
     
     # Calculate window
@@ -361,6 +362,7 @@ def get_elevation_window(src, x, y, window_size=DEFAULT_WINDOW_SIZE,
     
     # Read window
     window_data = src.read(1, window=((r_start, r_end), (c_start, c_end)))
+    print(f"window data (pre-filter): {window_data}")
     
     # Apply cross pattern if requested
     if window_type == 'cross':
@@ -376,11 +378,14 @@ def get_elevation_window(src, x, y, window_size=DEFAULT_WINDOW_SIZE,
     if src.nodata is not None:
         window_data = np.where(window_data == src.nodata, np.nan, window_data)
     window_data = np.where((window_data > 5000) | (window_data < -500), np.nan, window_data)
-    
+    print(f"window data (post-filter): {window_data}")
+
     valid = window_data[~np.isnan(window_data)]
+    print(f"valid (post-post-filter): {valid}")
+
     if len(valid) == 0:
         return np.nan, np.nan, 0
-    
+
     return float(np.mean(valid)), float(np.std(valid)), len(valid)
 
 
