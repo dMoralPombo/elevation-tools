@@ -362,7 +362,7 @@ def get_elevation_window(src, x, y, window_size=DEFAULT_WINDOW_SIZE,
     
     # Read window
     window_data = src.read(1, window=((r_start, r_end), (c_start, c_end)))
-    print(f"window data (pre-filter): {window_data}")
+    # print(f"window data (pre-filter): {window_data}")
     
     # Apply cross pattern if requested
     if window_type == 'cross':
@@ -378,10 +378,10 @@ def get_elevation_window(src, x, y, window_size=DEFAULT_WINDOW_SIZE,
     if src.nodata is not None:
         window_data = np.where(window_data == src.nodata, np.nan, window_data)
     window_data = np.where((window_data > 5000) | (window_data < -500), np.nan, window_data)
-    print(f"window data (post-filter): {window_data}")
+    # print(f"window data (post-filter): {window_data}")
 
     valid = window_data[~np.isnan(window_data)]
-    print(f"valid (post-post-filter): {valid}")
+    # print(f"valid (post-post-filter): {valid}")
 
     if len(valid) == 0:
         return np.nan, np.nan, 0
@@ -823,3 +823,127 @@ def get_dem_metadata(items_gdf):
     geocells = items_gdf['pgc:geocell'].tolist() if 'pgc:geocell' in items_gdf.columns else []
     dates = items_gdf['datetime'].tolist() if 'datetime' in items_gdf.columns else []
     return pairnames, geocells, dates
+
+
+def generate_orthogonal_transects(center_coords, half_length_m=3000):
+    """Generate two perpendicular transects centered on a point.
+    
+    Creates a North-South transect and an East-West transect,
+    both centered on the given coordinates.
+    
+    Parameters
+    ----------
+    center_coords : tuple
+        (lon, lat) in WGS84 or (x, y) in EPSG:3413
+    half_length_m : float
+        Half-length of each transect in meters (default 3000 = 3km each way)
+        
+    Returns
+    -------
+    list of tuples
+        [((start_ns, end_ns), 'N-S'), ((start_ew, end_ew), 'E-W')]
+        Each transect is ((start_lon, start_lat), (end_lon, end_lat), label)
+    """
+    lon, lat = center_coords
+    
+    # Convert center to EPSG:3413 for distance calculations
+    x_center, y_center = wgs84_to_3413(lon, lat)
+    
+    # North-South transect
+    ns_start_3413 = (x_center, y_center + half_length_m)
+    ns_end_3413 = (x_center, y_center - half_length_m)
+    
+    # East-West transect
+    ew_start_3413 = (x_center - half_length_m, y_center)
+    ew_end_3413 = (x_center + half_length_m, y_center)
+    
+    # Convert back to WGS84
+    transformer = Transformer.from_crs("EPSG:3413", "EPSG:4326", always_xy=True)
+    
+    ns_start_lon, ns_start_lat = transformer.transform(ns_start_3413[0], ns_start_3413[1])
+    ns_end_lon, ns_end_lat = transformer.transform(ns_end_3413[0], ns_end_3413[1])
+    
+    ew_start_lon, ew_start_lat = transformer.transform(ew_start_3413[0], ew_start_3413[1])
+    ew_end_lon, ew_end_lat = transformer.transform(ew_end_3413[0], ew_end_3413[1])
+    
+    transects = [
+        (((ns_start_lon, ns_start_lat), (ns_end_lon, ns_end_lat)), "North-South"),
+        (((ew_start_lon, ew_start_lat), (ew_end_lon, ew_end_lat)), "East-West"),
+    ]
+    
+    return transects
+
+
+def read_transects_from_geoparquet(parquet_path, lat_col='lat', lon_col='lon', 
+                                   label_col=None, half_length_m=3000):
+    """Read transect center points from a GeoParquet file and create orthogonal transects.
+    
+    The file should contain points with latitude and longitude columns.
+    For each point, generates N-S and E-W transects.
+    
+    Parameters
+    ----------
+    parquet_path : str
+        Path to the GeoParquet file
+    lat_col : str
+        Name of latitude column (default: 'lat')
+    lon_col : str
+        Name of longitude column (default: 'lon')
+    label_col : str, optional
+        Name of column to use for labeling transects (e.g., 'lake_name')
+        If None, uses row index
+    half_length_m : float
+        Half-length of each transect in meters
+        
+    Returns
+    -------
+    list of tuples
+        [((start, end), label, direction), ...]
+    """
+    import geopandas as gpd
+    
+    print(f"\nReading transect points from: {parquet_path}")
+    
+    # Determine file type
+    if parquet_path.endswith('.parquet'):
+        gdf = gpd.read_parquet(parquet_path)
+    elif parquet_path.endswith('.gpkg'):
+        gdf = gpd.read_file(parquet_path)
+
+    print(f"  Found {len(gdf)} points")
+    print(f"  Columns: {list(gdf.columns)}")
+    
+    # Check if it has geometry
+    if gdf.geometry is not None and not gdf.geometry.is_empty.all():
+        print(f"  Using geometry column")
+        # Extract coordinates from geometry
+        lons = gdf.geometry.x.values
+        lats = gdf.geometry.y.values
+    elif lon_col in gdf.columns and lat_col in gdf.columns:
+        print(f"  Using {lon_col}/{lat_col} columns")
+        lons = gdf[lon_col].values
+        lats = gdf[lat_col].values
+    else:
+        raise ValueError(f"Could not find coordinates. Expected geometry or {lon_col}/{lat_col} columns.")
+    
+    # Get labels
+    if label_col and label_col in gdf.columns:
+        labels = gdf[label_col].values
+    else:
+        labels = [f"Point_{i+1}" for i in range(len(gdf))]
+    
+    # Generate transects for each point
+    all_transects = []
+    
+    for i, (lon, lat, label) in enumerate(zip(lons, lats, labels)):
+        print(f"  {i+1}. {label}: ({lon:.4f}, {lat:.4f})")
+        
+        # Generate orthogonal transects
+        transects = generate_orthogonal_transects((lon, lat), half_length_m)
+        
+        for transect_coords, direction in transects:
+            all_transects.append((transect_coords, label, direction))
+    
+    print(f"\n  Generated {len(all_transects)} transects from {len(gdf)} points")
+    
+    return all_transects

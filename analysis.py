@@ -20,6 +20,12 @@ import glob
 # import rasterio.windows
 from matplotlib.colors import LightSource
 from pyproj import Transformer
+import tarfile
+from typing import List, Tuple, Optional, Dict, Any
+
+import matplotlib
+from scipy import stats
+from scipy.ndimage import label as nd_label
 
 # Import utilities
 from elevation_utils import (
@@ -32,6 +38,29 @@ from config import (
     DEFAULT_WINDOW_TYPE, COREG_PARAMS, get_output_path
 )
 
+# ============================================================================
+# SECONDARY AXIS LABELS HELPER
+# ============================================================================
+
+def _secondary_axis_labels(left, right, bottom, top, n_ticks=4):
+    """Compute EPSG:3413 tick positions and correct EPSG:4326 labels.
+    
+    Transforms x-ticks at the TOP edge for longitude,
+    and y-ticks at the RIGHT edge for latitude.
+    """
+    transformer = Transformer.from_crs("EPSG:3413", "EPSG:4326", always_xy=True)
+    
+    # Interior tick positions in EPSG:3413
+    x_ticks = np.linspace(left, right, n_ticks + 2)[1:-1]
+    y_ticks = np.linspace(bottom, top, n_ticks + 2)[1:-1]
+    
+    # Transform x-ticks at the TOP edge → gives longitude at top of plot
+    lon_ticks, _ = transformer.transform(x_ticks, np.full_like(x_ticks, top))
+    
+    # Transform y-ticks at the RIGHT edge → gives latitude at right of plot
+    _, lat_ticks = transformer.transform(np.full_like(y_ticks, right), y_ticks)
+    
+    return x_ticks, y_ticks, lon_ticks, lat_ticks
 
 # ============================================================================
 # DATE HELPERS
@@ -795,21 +824,28 @@ def plot_combined_profiles(all_profiles, coreg_mode='none', cmap='terrain', lake
         else:
             title_date = refdemname
 
-        ax1.set_title(f"Reference DEM Elevation - {title_date}", pad=12, fontsize=11)
+        ax1.set_title(f"Reference DEM Elevation - {title_date}", pad=13, fontsize=11)
         ax1.legend(fontsize=8, loc="upper right")
         cbar1 = fig.colorbar(img1, ax=ax1, orientation="vertical", pad=0.2, 
-                            fraction=0.033, aspect=25)
-        cbar1.set_label("Elevation (m)", rotation=270, labelpad=13, fontsize=11)
+                            fraction=0.025, aspect=25)
+        cbar1.set_label("Elevation (m)", rotation=270, labelpad=13, fontsize=10)
 
+        # Add primary axes for EPSG:3413 coordinates
+        x_m_ticks = np.linspace(window_bounds[0], window_bounds[2], 6)[1:-1]
+        y_m_ticks = np.linspace(window_bounds[1], window_bounds[3], 6)[1:-1]
+        ax1.set_xticks(x_m_ticks)
+        ax1.set_xticklabels([f"{int(x_i)}" for x_i in x_m_ticks])
+        ax1.set_xlabel("X (m) - EPSG 3413", labelpad=8)        
+        ax1.set_yticks(y_m_ticks)
+        ax1.set_yticklabels([f"{int(y_i)}" for y_i in y_m_ticks])
+        ax1.set_ylabel("Y (m) - EPSG 3413", labelpad=10, rotation=90)
+        ax1.tick_params(labelsize=8)
+        
         # Add secondary axes for EPSG:4326 coordinates
-        from pyproj import Transformer
-        transformer = Transformer.from_crs("EPSG:3413", "EPSG:4326", always_xy=True)
-        ax1.secondary_xaxis("top", functions=(
-            lambda x: transformer.transform(x, np.full_like(x, window_bounds[1]))[0], 
-            lambda x: x))
-        ax1.secondary_yaxis("right", functions=(
-            lambda y: transformer.transform(np.full_like(y, window_bounds[0]), y)[1], 
-            lambda y: y))
+        x_ticks, y_ticks, lon_ticks, lat_ticks = _secondary_axis_labels(
+            window_bounds[0], window_bounds[2], window_bounds[1], window_bounds[3]
+        )
+        _add_secondary_axes(ax1, x_ticks, y_ticks, lon_ticks, lat_ticks)
 
         # BOTTOM LEFT - Hillshade
         ax2 = fig.add_subplot(gs[1, 0])
@@ -833,12 +869,27 @@ def plot_combined_profiles(all_profiles, coreg_mode='none', cmap='terrain', lake
 
         ax2.set_title(f"Hillshade - {title_date}", pad=10, fontsize=11)
         ax2.legend(fontsize=8, loc="upper right")
-        ax2.secondary_xaxis("top", functions=(
-            lambda x: transformer.transform(x, np.full_like(x, window_bounds[1]))[0], 
-            lambda x: x))
-        ax2.secondary_yaxis("right", functions=(
-            lambda y: transformer.transform(np.full_like(y, window_bounds[0]), y)[1], 
-            lambda y: y))
+        # ax2.secondary_xaxis("top", functions=(
+        #     lambda x: transformer.transform(x, np.full_like(x, window_bounds[1]))[0], 
+        #     lambda x: x))
+        # ax2.secondary_yaxis("right", functions=(
+        #     lambda y: transformer.transform(np.full_like(y, window_bounds[0]), y)[1], 
+        #     lambda y: y))
+
+        # Add primary axes for EPSG:3413 coordinates
+        ax2.set_xticks(x_m_ticks)
+        ax2.set_xticklabels([f"{int(x_i)}" for x_i in x_m_ticks])
+        ax2.set_xlabel("X (m) - EPSG 3413", labelpad=8)        
+        ax2.set_yticks(y_m_ticks)
+        ax2.set_yticklabels([f"{int(y_i)}" for y_i in y_m_ticks])
+        ax2.set_ylabel("Y (m) - EPSG 3413", labelpad=10, rotation=90)
+        ax2.tick_params(labelsize=8)
+
+        ax2.set_ylabel("Y (m) - EPSG 3413", labelpad=10, rotation=90)
+        ax2.tick_params(labelsize=8)
+
+        _add_secondary_axes(ax2, x_ticks, y_ticks, lon_ticks, lat_ticks)
+
 
     # RIGHT PLOT - All elevation profiles (spans both rows)
     ax3 = fig.add_subplot(gs[:, 1])
@@ -1060,7 +1111,7 @@ def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, 
     ax1.set_xlabel('Distance along transect (km)', fontsize=12)
     ax1.set_title(title, fontsize=13, pad=10, fontweight='bold')
     
-    cbar = plt.colorbar(im, ax=ax1, label='Elevation Change (m)', fraction=0.05, pad=0.02)
+    # cbar = plt.colorbar(im, ax=ax1, label='Elevation Change (m)', fraction=0.05, pad=0.02)
     
     # Mark reference line - improved positioning
     ref_idx = profiles_sorted.index(reference_profile)
@@ -1690,7 +1741,7 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
     profiles_sorted = sorted(all_profiles["profiles"], 
                             key=lambda x: extract_date_obj(x["metadata"]["dem_name"]))
     
-    # Use the oldest as reference
+    # Use the oldest as reference if no other predefined
     reference_profile = profiles_sorted[0]
     reference_path = reference_profile["metadata"]["path"]
     reference_date = extract_date_label(reference_profile["metadata"]["dem_name"])
@@ -2101,8 +2152,643 @@ def additional_plots(all_profiles, reference_year=None, coreg_mode='none', lake_
 
     print(f"\n=== Generating elevation change heatmap and relative difference plots ===")
     # output_heatmap = plot_heatmap(all_profiles, reference_year=reference_year, lake_name=lake_name, output_path=output_path)
-    output_diff_heatmap = plot_difference_heatmap(all_profiles, reference_year=reference_year, lake_name=lake_name, output_path=output_path)
-    all_profiles['heatmap_path'] = output_diff_heatmap
+    # output_diff_heatmap = plot_difference_heatmap(all_profiles, reference_year=reference_year, lake_name=lake_name, output_path=output_path)
+    # all_profiles['heatmap_path'] = output_diff_heatmap
 
     output_rel_diff = plot_relative_differences(all_profiles, coreg_mode=coreg_mode, lake_name=lake_name, output_path=output_path)
     all_profiles['relative_diff_path'] = output_rel_diff
+
+
+def add_latlon_grid(ax, left, right, bottom, top, n_meridians=5, n_parallels=5):
+    """Add a proper lat/lon grid overlay to verify coordinate transformations.
+    
+    Draws meridians and parallels across the full extent of the plot
+    and labels them for visual verification.
+    
+    Parameters
+    ----------
+    ax : matplotlib Axes
+    left, right, bottom, top : float
+        Bounds in EPSG:3413
+    n_ticks : int
+        Number of grid lines in each direction
+    """
+    from pyproj import Transformer
+    transformer = Transformer.from_crs("EPSG:3413", "EPSG:4326", always_xy=True)
+
+    # Get the WGS84 extent of the plot area
+    # Sample corners and edges to get the lat/lon range
+    x_corners = [left, right, right, left]
+    y_corners = [bottom, bottom, top, top]
+    lons_corners, lats_corners = transformer.transform(x_corners, y_corners)
+    
+    lon_min, lon_max = min(lons_corners), max(lons_corners)
+    lat_min, lat_max = min(lats_corners), max(lats_corners)
+    
+    # Add some padding
+    lon_pad = (lon_max - lon_min) * 0.1
+    lat_pad = (lat_max - lat_min) * 0.1
+    lon_min -= lon_pad
+    lon_max += lon_pad
+    lat_min -= lat_pad
+    lat_max += lat_pad
+    
+    # Generate meridians (lines of constant longitude)
+    meridian_lons = np.linspace(lon_min, lon_max, n_meridians + 2)[1:-1]
+    
+    for mer_lon in meridian_lons:
+        # Sample along this meridian at many latitudes
+        sample_lats = np.linspace(lat_min, lat_max, 200)
+        sample_lons = np.full_like(sample_lats, mer_lon)
+        
+        # Transform to EPSG:3413
+        x_points, y_points = transformer.transform(sample_lons, sample_lats)
+        
+        # Clip to plot extent
+        valid = (x_points >= left) & (x_points <= right) & \
+                (y_points >= bottom) & (y_points <= top)
+        
+        if np.sum(valid) > 2:
+            ax.plot(x_points[valid], y_points[valid], 
+                   color='cyan', linewidth=0.8, alpha=0.7, 
+                   linestyle='-', zorder=5)
+            
+            # Label at the top of the plot
+            # Find the point closest to the top
+            top_idx = np.argmax(y_points[valid])
+            if top_idx < len(x_points[valid]):
+                ax.annotate(f'{mer_lon:.4f}°E', 
+                           xy=(x_points[valid][top_idx], y_points[valid][top_idx]),
+                           xytext=(0, 6), textcoords='offset points',
+                           fontsize=7, color='cyan', ha='center', va='bottom',
+                           bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6))
+    
+    # Generate parallels (lines of constant latitude)
+    parallel_lats = np.linspace(lat_min, lat_max, n_parallels + 2)[1:-1]
+    
+    for par_lat in parallel_lats:
+        # Sample along this parallel
+        sample_lons = np.linspace(lon_min, lon_max, 200)
+        sample_lats = np.full_like(sample_lons, par_lat)
+        
+        # Transform to EPSG:3413
+        x_points, y_points = transformer.transform(sample_lons, sample_lats)
+        
+        # Clip to plot extent
+        valid = (x_points >= left) & (x_points <= right) & \
+                (y_points >= bottom) & (y_points <= top)
+        
+        if np.sum(valid) > 2:
+            ax.plot(x_points[valid], y_points[valid], 
+                   color='cyan', linewidth=0.8, alpha=0.7,
+                   linestyle='-', zorder=5)
+            
+            # Label at the right edge
+            right_idx = np.argmax(x_points[valid])
+            if right_idx < len(x_points[valid]):
+                ax.annotate(f'{par_lat:.4f}°N',
+                           xy=(x_points[valid][right_idx], y_points[valid][right_idx]),
+                           xytext=(6, 0), textcoords='offset points',
+                           fontsize=7, color='cyan', ha='left', va='center',
+                           bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6))
+
+
+def _secondary_axis_labels(left, right, bottom, top, n_ticks=4):
+    """Compute EPSG:3413 tick positions and correct EPSG:4326 labels.
+    
+    Transforms x-ticks at the TOP edge for longitude labels,
+    and y-ticks at the RIGHT edge for latitude labels.
+    """
+    transformer = Transformer.from_crs("EPSG:3413", "EPSG:4326", always_xy=True)
+    
+    # Interior tick positions in EPSG:3413
+    x_ticks = np.linspace(left, right, n_ticks + 2)[1:-1]
+    y_ticks = np.linspace(bottom, top, n_ticks + 2)[1:-1]
+    
+    # Transform x-ticks at the TOP edge → gives longitude at top of plot
+    lon_ticks, _ = transformer.transform(x_ticks, np.full_like(x_ticks, top))
+    
+    # Transform y-ticks at the RIGHT edge → gives latitude at right of plot
+    _, lat_ticks = transformer.transform(np.full_like(y_ticks, right), y_ticks)
+    
+    return x_ticks, y_ticks, lon_ticks, lat_ticks
+
+
+
+def _add_primary_axes(ax, x_ticks, y_ticks, x_m_ticks, y_m_ticks):
+    """Add secondary top/right axes with EPSG:4326 labels."""
+    ax_x = ax.xaxis("bottom")
+    ax_x.set_xticks(x_ticks)
+    ax_x.set_xticklabels([f"{int(x_i)}" for x_i in x_m_ticks])
+    ax_x.set_xlabel("X (m) - EPSG 3413", labelpad=8)
+    ax_x.tick_params(labelsize=8)
+    
+    ax_y = ax.yaxis("left")
+    ax_y.set_yticks(y_ticks)
+    ax_y.set_yticklabels([f"{int(y_i)}" for y_i in y_m_ticks])
+    ax_y.set_ylabel("Y (m) - EPSG 3413", labelpad=10, rotation=90)
+    ax_y.tick_params(labelsize=8)
+
+
+def _add_secondary_axes(ax, x_ticks, y_ticks, lon_ticks, lat_ticks):
+    """Add secondary top/right axes with EPSG:4326 labels."""
+    secax_x = ax.secondary_xaxis("top")
+    secax_x.set_xticks(x_ticks)
+    secax_x.set_xticklabels([f"{lon:.4f}°" for lon in lon_ticks])
+    secax_x.set_xlabel("Longitude - EPSG 4326", labelpad=8)
+    secax_x.tick_params(labelsize=8)
+    
+    secax_y = ax.secondary_yaxis("right")
+    secax_y.set_yticks(y_ticks)
+    secax_y.set_yticklabels([f"{lat:.4f}°" for lat in lat_ticks])
+    secax_y.set_ylabel("Latitude - EPSG 4326", labelpad=10, rotation=270)
+    secax_y.tick_params(labelsize=8)
+
+def verify_coordinate_transforms(all_profiles, margin_km=2):
+    """Plot the reference DEM with lat/lon grid and transect to verify coordinates."""
+    if not all_profiles["profiles"]:
+        print("No profiles to verify")
+        return
+    
+    selected_profile = all_profiles["profiles"][0]
+    raster_metadata = selected_profile["metadata"]
+    x0, y0, x1, y1 = selected_profile["coords"]
+    transect_coords = all_profiles["transect_coords"]
+    
+    demfile = raster_metadata["path"]
+    if not os.path.exists(demfile):
+        demfile = find_and_unzip(demfile)
+    
+    with rio.open(demfile) as src:
+        margin = margin_km * 1000
+        min_x = min(x0, x1) - margin
+        max_x = max(x0, x1) + margin
+        min_y = min(y0, y1) - margin
+        max_y = max(y0, y1) + margin
+        
+        window = src.window(min_x, min_y, max_x, max_y)
+        window_bounds = rio.windows.bounds(window, src.transform)
+        
+        left, bottom, right, top = window_bounds
+        
+        print(f"\nPlot bounds (EPSG:3413):")
+        print(f"  left={left:.1f}, right={right:.1f}")
+        print(f"  bottom={bottom:.1f}, top={top:.1f}")
+        print(f"  width={right-left:.0f}m, height={top-bottom:.0f}m")
+        
+        # Get WGS84 extent by sampling many points
+        from pyproj import Transformer
+        transformer = Transformer.from_crs("EPSG:3413", "EPSG:4326", always_xy=True)
+        inv_transformer = Transformer.from_crs("EPSG:4326", "EPSG:3413", always_xy=True)
+        
+        # Sample corners and edges
+        x_samples = np.linspace(left, right, 20)
+        y_samples = np.linspace(bottom, top, 20)
+        
+        # Get lon/lat range by checking all corners
+        corners_x = [left, right, right, left, left, left, right, right]
+        corners_y = [bottom, bottom, top, top, bottom, top, bottom, top]
+        lons, lats = transformer.transform(corners_x, corners_y)
+        
+        lon_min, lon_max = np.min(lons), np.max(lons)
+        lat_min, lat_max = np.min(lats), np.max(lats)
+        
+        print(f"WGS84 extent:")
+        print(f"  lon: [{lon_min:.6f}, {lon_max:.6f}]")
+        print(f"  lat: [{lat_min:.6f}, {lat_max:.6f}]")
+        
+        # Read raster
+        raster_data = src.read(1, window=window)
+        if src.nodata is not None:
+            raster_data_masked = np.ma.masked_equal(raster_data, src.nodata)
+        else:
+            raster_data_masked = np.ma.masked_invalid(raster_data)
+        
+        # Create figure with 3 panels
+        fig, axes = plt.subplots(1, 3, figsize=(22, 7))
+        
+        # ── PANEL 1: Grid only (no DEM) ──
+        ax0 = axes[0]
+        ax0.set_xlim(left, right)
+        ax0.set_ylim(bottom, top)
+        ax0.set_aspect('equal')
+        ax0.set_facecolor('white')
+        
+        # Draw meridians
+        meridian_lons = np.linspace(lon_min, lon_max, 6)
+        print(f"\nMeridians: {meridian_lons}")
+        
+        for i, mer_lon in enumerate(meridian_lons):
+            sample_lats = np.linspace(lat_min, lat_max, 100)
+            sample_lons = np.full_like(sample_lats, mer_lon)
+            x_mer, y_mer = inv_transformer.transform(sample_lons, sample_lats)
+            
+            # Clip to extent
+            valid = (x_mer >= left) & (x_mer <= right) & (y_mer >= bottom) & (y_mer <= top)
+            
+            if np.sum(valid) > 2:
+                ax0.plot(x_mer[valid], y_mer[valid], 'b-', linewidth=1.5, alpha=0.8)
+                # Label at top
+                top_idx = np.argmax(y_mer[valid])
+                ax0.annotate(f'{mer_lon:.4f}°E', 
+                           xy=(x_mer[valid][top_idx], y_mer[valid][top_idx]),
+                           xytext=(0, 8), textcoords='offset points',
+                           fontsize=8, color='blue', ha='center', fontweight='bold')
+        
+        # Draw parallels
+        parallel_lats = np.linspace(lat_min, lat_max, 6)
+        print(f"Parallels: {parallel_lats}")
+        
+        for i, par_lat in enumerate(parallel_lats):
+            sample_lons = np.linspace(lon_min, lon_max, 100)
+            sample_lats = np.full_like(sample_lons, par_lat)
+            x_par, y_par = inv_transformer.transform(sample_lons, sample_lats)
+            
+            valid = (x_par >= left) & (x_par <= right) & (y_par >= bottom) & (y_par <= top)
+            
+            if np.sum(valid) > 2:
+                ax0.plot(x_par[valid], y_par[valid], 'r-', linewidth=1.5, alpha=0.8)
+                # Label at right
+                right_idx = np.argmax(x_par[valid])
+                ax0.annotate(f'{par_lat:.4f}°N',
+                           xy=(x_par[valid][right_idx], y_par[valid][right_idx]),
+                           xytext=(8, 0), textcoords='offset points',
+                           fontsize=8, color='red', ha='left', fontweight='bold')
+        
+        ax0.plot([x0, x1], [y0, y1], 'k-', linewidth=2, zorder=10)
+        ax0.plot(x0, y0, 'ko', markersize=8, zorder=10)
+        ax0.plot(x1, y1, 'ko', markersize=8, zorder=10)
+        ax0.set_title("GRID ONLY VERIFICATION\n(blue=meridians, red=parallels)", 
+                     fontsize=10, fontweight='bold')
+        ax0.set_xlabel("EPSG:3413 X (m)")
+        ax0.set_ylabel("EPSG:3413 Y (m)")
+        ax0.grid(True, alpha=0.3)
+        
+        # ── PANEL 2: DEM with grid overlaid ──
+        ax1 = axes[1]
+        ax1.imshow(raster_data_masked, cmap='terrain',
+                  extent=(left, right, bottom, top),
+                  origin='upper', aspect='equal', interpolation='none',
+                  zorder=0)
+        
+        # Redraw grid on top of DEM
+        for mer_lon in meridian_lons:
+            sample_lats = np.linspace(lat_min, lat_max, 100)
+            sample_lons = np.full_like(sample_lats, mer_lon)
+            x_mer, y_mer = inv_transformer.transform(sample_lons, sample_lats)
+            valid = (x_mer >= left) & (x_mer <= right) & (y_mer >= bottom) & (y_mer <= top)
+            if np.sum(valid) > 2:
+                ax1.plot(x_mer[valid], y_mer[valid], 'cyan', linewidth=1.2, alpha=0.9, zorder=10)
+        
+        for par_lat in parallel_lats:
+            sample_lons = np.linspace(lon_min, lon_max, 100)
+            sample_lats = np.full_like(sample_lons, par_lat)
+            x_par, y_par = inv_transformer.transform(sample_lons, sample_lats)
+            valid = (x_par >= left) & (x_par <= right) & (y_par >= bottom) & (y_par <= top)
+            if np.sum(valid) > 2:
+                ax1.plot(x_par[valid], y_par[valid], 'cyan', linewidth=1.2, alpha=0.9, zorder=10)
+        
+        # Transect
+        ax1.plot([x0, x1], [y0, y1], 'r-', linewidth=2.5, label='Transect', zorder=15)
+        ax1.plot(x0, y0, 'ro', markersize=10, markeredgecolor='white', 
+                markeredgewidth=2, label='Start (A)', zorder=15)
+        ax1.plot(x1, y1, 'bo', markersize=10, markeredgecolor='white',
+                markeredgewidth=2, label='End (B)', zorder=15)
+        
+        # Add secondary axes
+        x_ticks, y_ticks, lon_ticks, lat_ticks = _secondary_axis_labels(
+            left, right, bottom, top, n_ticks=4
+        )
+        _add_secondary_axes(ax1, x_ticks, y_ticks, lon_ticks, lat_ticks)
+        
+        ax1.set_title("DEM WITH GRID OVERLAY\n(cyan lines, secondary axes in °)", 
+                     fontsize=10, fontweight='bold')
+        ax1.set_xlabel("EPSG:3413 X (m)")
+        ax1.set_ylabel("EPSG:3413 Y (m)")
+        ax1.legend(loc='upper right', fontsize=7)
+        
+        # ── PANEL 3: Diagnostic text ──
+        ax2 = axes[2]
+        ax2.axis('off')
+        
+        start_wgs = transect_coords[0]
+        end_wgs = transect_coords[1]
+        start_3413 = wgs84_to_3413(*start_wgs)
+        end_3413 = wgs84_to_3413(*end_wgs)
+        
+        lines = []
+        lines.append("=" * 45)
+        lines.append("COORDINATE VERIFICATION")
+        lines.append("=" * 45)
+        lines.append("")
+        lines.append("TRANSECT (WGS84):")
+        lines.append(f"  Start: {start_wgs[0]:.6f}°E, {start_wgs[1]:.6f}°N")
+        lines.append(f"  End:   {end_wgs[0]:.6f}°E, {end_wgs[1]:.6f}°N")
+        lines.append("")
+        lines.append("TRANSECT (EPSG:3413):")
+        lines.append(f"  Start: ({start_3413[0]:.1f}, {start_3413[1]:.1f})")
+        lines.append(f"  End:   ({end_3413[0]:.1f}, {end_3413[1]:.1f})")
+        lines.append("")
+        lines.append("METADATA (EPSG:3413):")
+        lines.append(f"  x0,y0: ({x0:.1f}, {y0:.1f})")
+        lines.append(f"  x1,y1: ({x1:.1f}, {y1:.1f})")
+        lines.append("")
+        
+        dx = abs(x0 - start_3413[0])
+        dy = abs(y0 - start_3413[1])
+        lines.append(f"  Match: Δstart=({dx:.1f},{dy:.1f})m")
+        lines.append("")
+        lines.append("WGS84 EXTENT:")
+        lines.append(f"  Lon: [{lon_min:.6f}, {lon_max:.6f}]")
+        lines.append(f"  Lat: [{lat_min:.6f}, {lat_max:.6f}]")
+        lines.append("")
+        lines.append("SECONDARY AXIS LABELS:")
+        for x_t, lon_t in zip(x_ticks, lon_ticks):
+            lines.append(f"  Top: x={x_t:.0f} → {lon_t:.6f}°E")
+        for y_t, lat_t in zip(y_ticks, lat_ticks):
+            lines.append(f"  Right: y={y_t:.0f} → {lat_t:.6f}°N")
+        
+        ax2.text(0.02, 0.98, '\n'.join(lines), transform=ax2.transAxes,
+                fontsize=7, fontfamily='monospace', verticalalignment='top')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Check if the cyan lines match the secondary axis labels
+        print("\n" + "=" * 50)
+        print("VISUAL CHECK:")
+        print("=" * 50)
+        print("Panel 1 (left):  Grid lines on white background")
+        print("  - Blue vertical-ish lines = meridians (constant longitude)")
+        print("  - Red horizontal-ish lines = parallels (constant latitude)")
+        print("")
+        print("Panel 2 (center): Grid overlaid on DEM")
+        print("  - Cyan lines should be visible on top of the terrain")
+        print("  - Secondary axis labels (top/right) should match cyan labels")
+
+
+def batch_process_elevation_histories_gz(
+    geocells,
+    pairnames,
+    dates,
+    coords,
+    archdir,
+    output_path=None,
+    window_size=DEFAULT_WINDOW_SIZE,
+    window_type=DEFAULT_WINDOW_TYPE,
+):
+    """Track elevation values at a point across multiple DEMs from compressed files.
+    
+    Reads elevations directly from .tar.gz or .gz files without full extraction.
+    
+    Parameters
+    ----------
+    geocells, pairnames, dates : lists
+        DEM identifiers from STAC search
+    coords : tuple
+        (lon, lat) in WGS84
+    archdir : str
+        Archive directory path
+    output_path : str, optional
+        Output directory
+    window_size, window_type : as in get_elevation_window
+        
+    Returns
+    -------
+    dict
+        Elevation history data
+    """
+    if output_path is None:
+        output_path = OUTPUT_DIR
+    
+    print(f"\n=== Processing elevation history from compressed files ===")
+    print(f"DEMs: {len(pairnames)}")
+    print(f"Window: {window_size}x{window_size} {window_type}")
+    
+    # Transform coordinates
+    coords_3413 = wgs84_to_3413(*coords)
+    x, y = coords_3413
+    print(f"Coordinates (EPSG:3413): {x:.1f}, {y:.1f}")
+    
+    # Parse dates
+    date_objs = []
+    for d in dates:
+        try:
+            date_objs.append(datetime.strptime(d, "%Y-%m-%dT%H:%M:%SZ"))
+        except:
+            try:
+                date_objs.append(datetime.strptime(d, "%Y-%m-%d"))
+            except:
+                date_objs.append(datetime(2000, 1, 1))
+    
+    # Initialize storage
+    history = {
+        'elevations': [],
+        'elevations_std': [],
+        'valid_pixels': [],
+        'dates': [],
+        'pairnames': [],
+        'metadata': [],
+        'coords_4326': coords,
+        'coords_3413': coords_3413,
+        'window_size': window_size,
+        'window_type': window_type,
+    }
+    
+    # Process each DEM
+    for i, (geocell, pairname) in enumerate(zip(geocells, pairnames)):
+        raster_path = os.path.join(
+            archdir,
+            f"{geocell}/SETSM_s2s041_{pairname}_2m_lsf_seg1_dem.tif"
+        )
+        
+        try:
+            mean_elev, std_elev, valid_count = read_elevation_from_compressed(
+                raster_path, x, y, window_size, window_type
+            )
+            
+            history['elevations'].append(mean_elev)
+            history['elevations_std'].append(std_elev)
+            history['valid_pixels'].append(valid_count)
+            history['dates'].append(date_objs[i])
+            history['pairnames'].append(pairname)
+            history['metadata'].append({
+                'geocell': geocell,
+                'path': raster_path,
+                'valid': not np.isnan(mean_elev),
+                'valid_pixels': valid_count,
+                'std': std_elev,
+            })
+            
+            if (i + 1) % 50 == 0 or i == len(pairnames) - 1:
+                print(f"  Processed {i+1}/{len(pairnames)}: "
+                      f"{sum(1 for m in history['metadata'] if m.get('valid', False))} valid")
+                
+        except Exception as e:
+            print(f"  Error processing {pairname}: {e}")
+            history['elevations'].append(np.nan)
+            history['elevations_std'].append(np.nan)
+            history['valid_pixels'].append(0)
+            history['dates'].append(date_objs[i])
+            history['pairnames'].append(pairname)
+            history['metadata'].append({'error': str(e), 'valid': False})
+    
+    # Summary
+    valid_count = sum(1 for m in history['metadata'] if m.get('valid', False))
+    print(f"\n✓ Complete: {valid_count}/{len(pairnames)} valid elevations")
+    
+    return history
+
+
+def batch_process_elevation_histories_coregistered(
+    geocells,
+    pairnames,
+    dates,
+    coords,
+    archdir,
+    output_path=None,
+    coreg_mode="altim",
+    window_size=DEFAULT_WINDOW_SIZE,
+    window_type=DEFAULT_WINDOW_TYPE,
+):
+    """Track elevation values at a point across multiple coregistered DEMs.
+    
+    Parameters
+    ----------
+    geocells, pairnames, dates : lists
+        DEM identifiers from STAC search
+    coords : tuple
+        (lon, lat) in WGS84
+    archdir : str
+        Archive directory path
+    output_path : str, optional
+        Output directory
+    coreg_mode : str
+        'altim' or 'mosaic'
+    window_size, window_type : as in get_elevation_window
+        
+    Returns
+    -------
+    dict
+        Elevation history data
+    """
+    if output_path is None:
+        output_path = OUTPUT_DIR
+    
+    # Build coregistration suffix
+    if coreg_mode != 'none':
+        params = COREG_PARAMS.get(coreg_mode, {})
+        ref = params.get('reference_data', coreg_mode)
+        vel = params.get('filter_vel', '0')
+        dhdt = params.get('filter_dhdt', '0')
+        coreg_choice = params.get('coreg_choice', 'vertical_offset_mean nuthkaab deramp')
+        coreg_choice_cl = "_".join(coreg_choice.split())
+        suffix = f"_{ref}_v_{vel}-0_dh_{dhdt}-0000_['vertical_offset_mean', 'nuthkaab', 'deramp']"
+    else:
+        suffix = ""
+    
+    print(f"\n=== Processing elevation history ({coreg_mode} coregistered) ===")
+    print(f"DEMs: {len(pairnames)}")
+    print(f"Window: {window_size}x{window_size} {window_type}")
+    print(f"Coreg suffix: {suffix[:50]}...")
+    
+    # Transform coordinates
+    coords_3413 = wgs84_to_3413(*coords)
+    x, y = coords_3413
+    print(f"Coordinates (EPSG:3413): {x:.1f}, {y:.1f}")
+    
+    # Parse dates
+    date_objs = []
+    for d in dates:
+        try:
+            date_objs.append(datetime.strptime(d, "%Y-%m-%dT%H:%M:%SZ"))
+        except:
+            try:
+                date_objs.append(datetime.strptime(d, "%Y-%m-%d"))
+            except:
+                date_objs.append(datetime(2000, 1, 1))
+    
+    # Initialize storage
+    history = {
+        'elevations': [],
+        'elevations_std': [],
+        'valid_pixels': [],
+        'dates': [],
+        'pairnames': [],
+        'metadata': [],
+        'coords_4326': coords,
+        'coords_3413': coords_3413,
+        'window_size': window_size,
+        'window_type': window_type,
+        'coreg_mode': coreg_mode,
+    }
+    
+    # Process each DEM
+    for i, (geocell, pairname) in enumerate(zip(geocells, pairnames)):
+        # Build path to coregistered file
+        base_dir = os.path.join(archdir, geocell)
+        
+        # Try different patterns for coregistered files
+        patterns = [
+            f"SETSM_s2s041_{pairname}_2m_lsf_seg1_dem{suffix}_coregistered.tif",
+            f"SETSM_s2s041_{pairname}_2m_lsf_seg1_dem*{coreg_mode}*coregistered.tif",
+        ]
+        
+        raster_path = None
+        for pattern in patterns:
+            matches = glob.glob(os.path.join(base_dir, pattern))
+            if matches:
+                raster_path = matches[0]
+                break
+        
+        if raster_path is None:
+            print(f"  {i+1}/{len(pairnames)}: {pairname[:30]}... - no coregistered file found\nfor patterns like {base_dir}/{patterns[0]}")
+            history['elevations'].append(np.nan)
+            history['elevations_std'].append(np.nan)
+            history['valid_pixels'].append(0)
+            history['dates'].append(date_objs[i])
+            history['pairnames'].append(pairname)
+            history['metadata'].append({
+                'geocell': geocell,
+                'valid': False,
+                'error': 'No coregistered file found',
+            })
+            continue
+        
+        try:
+            with rio.open(raster_path) as src:
+                mean_elev, std_elev, valid_count = get_elevation_window(
+                    src, x, y, window_size, window_type
+                )
+            
+            history['elevations'].append(mean_elev)
+            history['elevations_std'].append(std_elev)
+            history['valid_pixels'].append(valid_count)
+            history['dates'].append(date_objs[i])
+            history['pairnames'].append(pairname)
+            history['metadata'].append({
+                'geocell': geocell,
+                'path': raster_path,
+                'valid': not np.isnan(mean_elev),
+                'valid_pixels': valid_count,
+                'std': std_elev,
+            })
+            
+            if (i + 1) % 50 == 0 or i == len(pairnames) - 1:
+                print(f"  Processed {i+1}/{len(pairnames)}: "
+                      f"{sum(1 for m in history['metadata'] if m.get('valid', False))} valid")
+                
+        except Exception as e:
+            print(f"  Error processing {pairname}: {e}")
+            history['elevations'].append(np.nan)
+            history['elevations_std'].append(np.nan)
+            history['valid_pixels'].append(0)
+            history['dates'].append(date_objs[i])
+            history['pairnames'].append(pairname)
+            history['metadata'].append({'error': str(e), 'valid': False})
+    
+    # Summary
+    valid_count = sum(1 for m in history['metadata'] if m.get('valid', False))
+    print(f"\n✓ Complete: {valid_count}/{len(pairnames)} valid elevations")
+    
+    return history
