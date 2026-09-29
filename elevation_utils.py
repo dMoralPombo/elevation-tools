@@ -5,11 +5,12 @@ Coordinate transformations, file I/O, elevation extraction, and STAC queries.
 """
 
 import glob
-import gzip
 import os
-import shutil
+import re
 import tarfile
+from contextlib import contextmanager
 from datetime import datetime
+from functools import lru_cache
 from typing import List, Tuple, Optional, Dict, Any
 import geopandas as gpd
 import numpy as np
@@ -21,7 +22,7 @@ from rasterio import warp
 # Import configuration
 from config import (
     STAC_API_URL, COLLECTION_ID, DEFAULT_CRS, GEOGRAPHIC_CRS,
-    DEFAULT_WINDOW_SIZE, DEFAULT_WINDOW_TYPE, MAX_CLOUD_COVER
+    DEFAULT_WINDOW_SIZE, DEFAULT_WINDOW_TYPE, MAX_CLOUD_COVER, COREG_PARAMS
 )
 
 
@@ -140,187 +141,106 @@ def transform_bounds_to_wgs84(bounds, src_crs):
 
 
 # ============================================================================
-# FILE I/O UTILITIES
+# STRIP FILE LOOKUP
 # ============================================================================
 
-def find_dem_file(base_path):
-    """Find a DEM .tif file corresponding to a base path.
-    
+# STAC item id / strip name: [SETSM_s2s041_]<pairname>_2m_[lsf_]seg<N>
+_STRIP_ID_RX = re.compile(r"^(?:SETSM_s2s041_)?(?P<pair>.+?)_2m_(?:lsf_)?(?P<seg>seg\d+)$")
+
+
+def coreg_suffix(coreg_mode):
+    """Filename suffix between '_dem' and '_coregistered.tif' for a coreg mode.
+
+    Built from COREG_PARAMS, e.g. for 'altim':
+    "_cs2_v_999-0_dh_999-0000_['vertical_offset_mean', 'nuthkaab', 'deramp']"
+    """
+    params = COREG_PARAMS[coreg_mode]
+    recipe = str(params['coreg_choice'].split())
+    return (f"_{params['reference_data']}_v_{params['filter_vel']}-0"
+            f"_dh_{params['filter_dhdt']}-0000_{recipe}")
+
+
+@lru_cache(maxsize=512)
+def _list_geocell(archdir, geocell):
+    """Cached directory listing of one archive geocell."""
+    try:
+        return tuple(os.listdir(os.path.join(archdir, geocell)))
+    except OSError:
+        return ()
+
+
+def find_strip_file(archdir, geocell, strip, coreg_mode='none'):
+    """Locate the file to read for one strip.
+
     Parameters
     ----------
-    base_path : str
-        Base path or pattern
-        
+    archdir : str
+        Strip archive root (contains <geocell>/ directories)
+    geocell : str
+        e.g. 'n75w055'
+    strip : str
+        Pairname ('WV01_20150701_...') or STAC item id
+        ('SETSM_s2s041_WV01_20150701_..._2m_lsf_seg1'). An item id pins the
+        segment; a bare pairname takes the lowest segment available.
+    coreg_mode : str
+        'none'  -> the strip '.tar.gz' (read in memory by open_dem), falling
+                   back to an unpacked '_dem.tif'
+        'altim' / 'mosaic' -> the coregistered GeoTIFF whose suffix exactly
+                   matches coreg_suffix(coreg_mode). The doubled-prefix
+                   variant ('_cs2_v_cs2_v_...', an upstream naming bug) is
+                   accepted when the correct name is absent.
+        'lsf' is optional in every name.
+
     Returns
     -------
     str or None
-        Path to the DEM file
+        Path to the file, or None if nothing matches
     """
-    # Try direct .tif file
-    if base_path.endswith('.tif') and os.path.exists(base_path):
-        return base_path
-    
-    # Try patterns
-    patterns = [base_path + '*_dem.tif']
-    if base_path.endswith('.tar.gz'):
-        patterns.append(base_path[:-7] + '*_dem.tif')
-    
-    for pattern in patterns:
-        matches = glob.glob(pattern)
-        if matches:
-            shortened = f".../{'/'.join(matches[0].split('/')[-2:])}"
-            print(f"Found .tif file: {shortened}")
-            return matches[0]
-    
+    m = _STRIP_ID_RX.match(strip)
+    pair, seg = (m['pair'], m['seg']) if m else (strip, None)
+    seg_rx = re.escape(seg) if seg else r"seg\d+"
+    head = rf"SETSM_s2s041_{re.escape(pair)}_2m_(?:lsf_)?(?P<seg>{seg_rx})"
+
+    if coreg_mode == 'none':
+        tails = [r"\.tar\.gz", r"_dem\.tif"]
+    else:
+        suffix = coreg_suffix(coreg_mode)
+        doubled = f"_{COREG_PARAMS[coreg_mode]['reference_data']}_v{suffix}"
+        tails = [re.escape(f"_dem{suffix}_coregistered.tif"),
+                 re.escape(f"_dem{doubled}_coregistered.tif")]
+
+    names = _list_geocell(archdir, geocell)
+    for tail in tails:
+        rx = re.compile(head + tail + "$")
+        hits = sorted(((int(m['seg'][3:]), n) for n in names if (m := rx.match(n))))
+        if hits:
+            if seg is None and len(hits) > 1:
+                print(f"  ⚠ {pair}: {len(hits)} segments available, using seg{hits[0][0]} "
+                      f"(pass STAC item ids to pick the right one)")
+            return os.path.join(archdir, geocell, hits[0][1])
     return None
 
 
-def extract_dem_from_archive(archive_path):
-    """Extract DEM from compressed archive (.gz or .tar.gz).
-    
-    Parameters
-    ----------
-    archive_path : str
-        Path to compressed archive
-        
-    Returns
-    -------
-    str or None
-        Path to extracted DEM file
+@contextmanager
+def open_dem(path):
+    """Open a DEM for reading, as a context manager yielding a rasterio dataset.
+
+    GeoTIFFs are opened directly. For a strip '.tar.gz' the '_dem.tif' member
+    is streamed into memory; nothing is written to disk.
     """
-    extracted_dir = os.path.dirname(archive_path)
-    shortened = f".../{'/'.join(archive_path.split('/')[-2:])}"
-    
-    try:
-        if archive_path.endswith('.tar.gz'):
-            # Extract tarball
-            tar_file = archive_path[:-3]  # Remove .gz
-            with gzip.open(archive_path, 'rb') as f_gz:
-                with open(tar_file, 'wb') as f_tar:
-                    shutil.copyfileobj(f_gz, f_tar)
-            
-            with tarfile.open(tar_file, 'r') as tar:
-                tar.extractall(path=extracted_dir)
-            
-            os.remove(tar_file)
-            
-            # Find extracted DEM
-            base = archive_path[:-7]  # Remove .tar.gz
-            matches = glob.glob(f"{base}*_dem.tif")
-            return matches[0] if matches else None
-            
-        elif archive_path.endswith('.gz'):
-            # Check if it's a direct gzipped TIFF
-            with gzip.open(archive_path, 'rb') as f:
-                magic = f.read(4)
-            
-            if magic[:2] in (b'II', b'MM'):  # TIFF signature
-                tif_path = archive_path[:-3]
-                with gzip.open(archive_path, 'rb') as f_in, open(tif_path, 'wb') as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-                print(f"Extracted: {tif_path}")
-                return tif_path
-        
-        print(f"Unsupported format: {archive_path}")
-        return None
-        
-    except Exception as e:
-        print(f"Error extracting {shortened}: {e}")
-        return None
-
-
-def find_and_unzip(pathfile):
-    """
-    Finds a .tif file and/or unzips the .gz file if necessary.
-
-    Args:
-        pathfile (str): Path to the file without extension.
-
-    Returns:
-        str: Path to the .tif file if found or extracted, otherwise None.
-
-    Exceptions:
-        FileNotFoundError: If the .gz file or .tif file is not found.
-        gzip.BadGzipFile: If the .gz file is not a valid gzip file.
-        tarfile.TarError: If there is an error extracting the tar file.
-        Exception: For any other exceptions, returns None and prints the error message.
-    """
-    if pathfile.endswith(".tar.gz"):
-        tif_file_pattern = pathfile[:-7] + "*_dem.tif"
-    elif pathfile.endswith("_dem.tif"):
-        tif_file_pattern = pathfile
+    if path.endswith('.tar.gz'):
+        with tarfile.open(path, 'r:gz') as tar:
+            for member in tar:
+                if member.name.endswith('_dem.tif'):
+                    data = tar.extractfile(member).read()
+                    break
+            else:
+                raise ValueError(f"No _dem.tif inside {path}")
+        with rio.MemoryFile(data) as memfile, memfile.open() as src:
+            yield src
     else:
-        tif_file_pattern = pathfile[:-20] + "*_dem.tif"
-    # tif_file_pattern = pathfile + "*_dem.tif"
-    tif_file_list = glob.glob(tif_file_pattern)
-    if tif_file_list:
-        shortened_path = (
-            ".../"
-            + tif_file_list[0].split("/")[-2]
-            + "/"
-            + tif_file_list[0].split("/")[-1]
-        )
-        print(f"Found existing .tif file: {shortened_path}")
-        return tif_file_list[0]
-
-    gz_file_list = glob.glob(pathfile[:-25] + "*.gz")
-    if not gz_file_list:
-        print(f"⚠ No .gz found for {pathfile}. Skipping.")
-        return None
-
-    gz_file = gz_file_list[0]
-    extracted_dir = os.path.dirname(gz_file)
-
-    shortened_path_gz = ".../" + gz_file.split("/")[-2] + "/" + gz_file.split("/")[-1]
-    print(f"Unzipping .gz file: {shortened_path_gz}")
-
-    try:
-        # Check if .gz contains a .tif directly
-        with gzip.open(gz_file, "rb") as f_in:
-            magic = f_in.read(4)  # Read first bytes to check type
-
-        if magic.startswith(b"II") or magic.startswith(b"MM"):  # TIFF signature
-            # Extract directly to a .tif file
-            tif_file = gz_file[:-3]  # Remove .gz extension
-            with gzip.open(gz_file, "rb") as f_in, open(tif_file, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out)
-            print(f"Extracted TIFF: {tif_file}")
-            return tif_file
-
-        # Otherwise, assume .tar file inside
-        tar_file = gz_file[:-3]  # Remove .gz
-
-        with gzip.open(gz_file, "rb") as f_gz:
-            print("Opening gzip file")
-            with open(tar_file, "wb") as f_tar:
-                print("Copying gzip content to tar file")
-                shutil.copyfileobj(f_gz, f_tar)
-
-        with tarfile.open(tar_file, "r") as tar:
-            print("Opening tar file and extracting...")
-            tar.extractall(path=extracted_dir)
-            # print(f"Extracted contents of .../{tar_file.split('/')[-2]}/{tar_file.split('/')[-1]}")
-
-        os.remove(tar_file)
-
-        # Refresh search for .tif file
-        tif_file_list = glob.glob(f"{pathfile[:-25]}*_dem.tif")
-        if tif_file_list and len(tif_file_list) < 1:
-            print(f"⚠ No .tif files found: {tif_file_list}. Skipping...")
-        return tif_file_list[0] if tif_file_list else None
-
-    except FileNotFoundError as e:
-        print(f"⚠ File not found: {e}")
-        return None
-    except gzip.BadGzipFile as e:
-        print(f"⚠ Bad GZIP file: {e}")
-        return None
-    except tarfile.TarError as e:
-        print(f"⚠ Error extracting TAR file: {e}")
-        return None
-    except Exception as e:
-        print(f"⚠ Unexpected error: {e}\n for file {gz_file}")
-        return None
+        with rio.open(path) as src:
+            yield src
 
 
 # ============================================================================
@@ -622,7 +542,7 @@ def extract_elevation_profile(coords_4326, raster_path, num_samples=100):
     coords_4326 : tuple
         ((start_lon, start_lat), (end_lon, end_lat)) in WGS84
     raster_path : str
-        Path to DEM file
+        Path to DEM GeoTIFF or strip .tar.gz (read in memory)
     num_samples : int
         Number of elevation samples
         
@@ -637,11 +557,7 @@ def extract_elevation_profile(coords_4326, raster_path, num_samples=100):
     x0, y0 = origin
     x1, y1 = end
     
-    # Handle compressed files
-    if not raster_path.endswith('.tif') or not os.path.exists(raster_path):
-        raster_path = find_and_unzip(raster_path)
-    
-    with rio.open(raster_path) as src:
+    with open_dem(raster_path) as src:
         # Calculate distances
         distance = np.sqrt((x1 - x0)**2 + (y1 - y0)**2)
         transect = np.linspace(0, distance, num_samples)
@@ -659,56 +575,6 @@ def extract_elevation_profile(coords_4326, raster_path, num_samples=100):
                     elevations[i] = val
         
         return transect, elevations, distance, x0, y0, x1, y1
-
-
-def read_elevation_from_compressed(raster_path, x, y, window_size=3, window_type='square'):
-    """Read elevation from compressed file without full extraction.
-    
-    Parameters
-    ----------
-    raster_path : str
-        Path to raster or archive
-    x, y : float
-        Coordinates in EPSG:3413
-    window_size, window_type : as in get_elevation_window
-        
-    Returns
-    -------
-    tuple
-        (mean_elevation, std_elevation, valid_pixel_count)
-    """
-    # Find the archive file
-    gz_files = glob.glob(raster_path[:-8] + "*.gz")
-    if not gz_files:
-        gz_files = glob.glob(raster_path[:-18] + "*.gz")
-        if not gz_files:
-            # Try direct .tif
-            tif_files = glob.glob(raster_path[:-18] + "*_dem.tif")
-            if tif_files:
-                with rio.open(tif_files[0]) as src:
-                    return get_elevation_window(src, x, y, window_size, window_type)
-            return np.nan, np.nan, 0
-    
-    archive = gz_files[0]
-    
-    try:
-        if archive.endswith('.tar.gz'):
-            with tarfile.open(archive, 'r:gz') as tar:
-                dem_member = next((m for m in tar.getmembers() 
-                                  if m.name.endswith('_dem.tif')), None)
-                if not dem_member:
-                    return np.nan, np.nan, 0
-                
-                with tar.extractfile(dem_member) as f:
-                    with rio.MemoryFile(f.read()) as memfile:
-                        with memfile.open() as src:
-                            return get_elevation_window(src, x, y, window_size, window_type)
-        else:
-            with rio.open(archive) as src:
-                return get_elevation_window(src, x, y, window_size, window_type)
-    except Exception as e:
-        print(f"Error reading compressed file: {e}")
-        return np.nan, np.nan, 0
 
 
 # ============================================================================
@@ -748,7 +614,8 @@ def search_arcticdem_strips(bbox, time_range, max_items=None):
         params['limit'] = max_items
     
     search = client.search(**params)
-    items = list(search.items())
+    item_collection = search.item_collection()
+    items = list(item_collection)
     
     if not items:
         print("No DEMs found for the specified region and time range.")
@@ -756,11 +623,13 @@ def search_arcticdem_strips(bbox, time_range, max_items=None):
     
     try:
         items_gdf = gpd.GeoDataFrame.from_features(
-            search.item_collection().to_dict(),
+            item_collection.to_dict(),
             crs="epsg:4326"
         )
     except ValueError as e:
         raise ValueError(f"Error converting results: {e}")
+    # Item ids carry the segment (…_2m_lsf_seg1), which pairnames don't
+    items_gdf['stac_id'] = [item.id for item in items]
     
     print(f"Found {len(items)} StripDEMs")
     return items_gdf, items
@@ -823,6 +692,16 @@ def get_dem_metadata(items_gdf):
     geocells = items_gdf['pgc:geocell'].tolist() if 'pgc:geocell' in items_gdf.columns else []
     dates = items_gdf['datetime'].tolist() if 'datetime' in items_gdf.columns else []
     return pairnames, geocells, dates
+
+
+def get_strip_ids(items_gdf):
+    """STAC item ids (pairname plus segment) for find_strip_file().
+
+    Falls back to pairnames for GeoDataFrames without a 'stac_id' column.
+    """
+    if 'stac_id' in items_gdf.columns:
+        return items_gdf['stac_id'].tolist()
+    return get_dem_metadata(items_gdf)[0]
 
 
 def generate_orthogonal_transects(center_coords, half_length_m=3000):

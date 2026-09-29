@@ -832,12 +832,16 @@ def process_strip_pairs(strip_pairs,
             print(f"  Std diff: {np.std(diff.compressed()):.2f} m")
             print(f"  Min/Max: {np.min(diff.compressed()):.2f} / {np.max(diff.compressed()):.2f} m")
             
-            # Plot
+            # Plot (GeoTIFF-derived pairs carry their own bounds, which
+            # override any tile extent meant for the zarr arrays)
+            pair_kwargs = dict(plot_kwargs)
+            if metadata.get('bounds') is not None:
+                pair_kwargs['extent'] = tuple(metadata['bounds'])
             png_path = plot_elevation_difference(
                 diff, mask, strip_a, strip_b,
                 output_dir=output_dir,
                 metadata=metadata,
-                **plot_kwargs
+                **pair_kwargs
             )
             
         all_results[(strip_a, strip_b)] = {
@@ -860,6 +864,56 @@ def process_strip_pairs(strip_pairs,
     print(f"{'='*60}")
     
     return all_results
+
+
+def run_dem_difference(strip_pairs, zarr_dir=None, archive_dir=None,
+                       output_dir=None, coreg_suffix=None, tile=None,
+                       extent=None, shp_path=None, prefer_zarr=True,
+                       downsample_factor=10, max_pixels=2000, **plot_kwargs):
+    """Complete workflow for DEM difference analysis (zarr first, GeoTIFF fallback).
+
+    Parameters
+    ----------
+    strip_pairs : list of tuples
+        List of (strip_recent, strip_old) tuples (partial names OK)
+    zarr_dir : str, optional
+        Directory containing pre-computed zarr files
+    archive_dir : str, optional
+        Directory containing coregistered GeoTIFFs (fallback)
+    output_dir : str, optional
+        Output directory (defaults to config OUTPUT_DIR)
+    coreg_suffix : str, optional
+        Suffix for coregistered files (GeoTIFF fallback only)
+    tile : str, optional
+        Tile identifier for plot titles and, if extent is None, the extent lookup
+    extent : tuple, optional
+        (left, bottom, right, top) in EPSG:3413 metres for the zarr arrays
+    shp_path : str, optional
+        Path to shapefile for overlay
+    prefer_zarr, downsample_factor, max_pixels :
+        As in process_strip_pairs()
+    **plot_kwargs
+        Additional arguments passed to plot_elevation_difference()
+
+    Returns
+    -------
+    dict
+        Results with statistics and plot paths
+    """
+    return process_strip_pairs(
+        strip_pairs,
+        archive_dir=archive_dir,
+        zarr_dir=zarr_dir,
+        coreg_suffix=coreg_suffix,
+        output_dir=output_dir,
+        prefer_zarr=prefer_zarr,
+        downsample_factor=downsample_factor,
+        max_pixels=max_pixels,
+        tile=tile,
+        extent=extent,
+        shp_path=shp_path,
+        **plot_kwargs,
+    )
 
 
 def plot_elevation_difference1(
@@ -1261,12 +1315,9 @@ def plot_elevation_difference(
     if extent is None:
         # Try to get from tile name
         if tile:
-            full_bounds = get_tile_bounds(TILE)
-            left, bottom, right, top = full_bounds
-            EXTENT = (left, right, bottom, top)
-            extent = EXTENT
-            # extent = get_tile_extent(tile)
-            if extent:
+            full_bounds = get_tile_bounds(tile)
+            if full_bounds is not None:
+                extent = tuple(full_bounds)  # (left, bottom, right, top)
                 print(f"  Using extent from tile '{tile}': {extent}")
         
         # Fall back to metadata
@@ -1315,6 +1366,14 @@ def plot_elevation_difference(
         
         print(f"  Downsampled {downsample_factor}x: "
               f"{plot_width}×{plot_height} → {raster_ds.shape[1]}×{raster_ds.shape[0]}")
+        
+        # Adjust extent for the rows/cols trimmed off the right and bottom
+        if extent is not None:
+            left, bottom, right, top = extent
+            extent = (left,
+                      top - (top - bottom) * (h_new * downsample_factor / plot_height),
+                      left + (right - left) * (w_new * downsample_factor / plot_width),
+                      top)
     else:
         raster_ds = raster_data
         n_valid_approx = int(np.sum(crop_valid_mask))
@@ -1335,7 +1394,7 @@ def plot_elevation_difference(
     
     # ── CREATE FIGURE ──
     if extent is not None:
-        left, right, bottom, top = extent
+        left, bottom, right, top = extent
         data_width = right - left
         data_height = top - bottom
         data_aspect = data_width / data_height
@@ -1345,7 +1404,7 @@ def plot_elevation_difference(
         fig_height = max(5, min(12, fig_height))
         
         fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-        plot_extent = (left, right, bottom, top)
+        plot_extent = (left, right, bottom, top)  # imshow order
     else:
         fig, ax = plt.subplots(figsize=(8, 7))
         plot_extent = (0, plot_width, 0, plot_height)
@@ -1367,7 +1426,7 @@ def plot_elevation_difference(
     
     # ── AXIS LABELS ──
     if extent is not None:
-        left, right, bottom, top = extent
+        left, bottom, right, top = extent
         
         x_ticks, y_ticks, lon_ticks, lat_ticks = _secondary_axis_labels(
             left, right, bottom, top

@@ -143,12 +143,15 @@ def robust_event_bounds(df, window, elev_col="Elevation (m)", low_pct=5, high_pc
 # STAGE 2 -- refined volume from full-resolution zarr rasters + lake polygon
 # ===========================================================================
 
-# Folder naming, confirmed consistent across all strips:
-#   processed_<platform>_<YYYYMMDD>_<catalogID>_dt.zarr
+# Folder naming: processed_<platform>_<YYYYMMDD>_<catalogID>_<catalogID>[_dt].zarr
+# (filled_arrays has no "_dt"; archive tile_zarrs does)
 STRIP_DATE_PATTERN = re.compile(r"processed_[A-Za-z0-9]+_(\d{8})_")
 
-TILE_ZARR_BASE = "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/tile_zarrs"
-TILE_ZARR_SUBFOLDER = "cs2_v_999_dh_999_vertical_offset_mean_nuthkaab_deramp_50m"
+# filled_arrays/<tile>/<subfolder> has the same layout for every tile. The
+# archive copy (.../ArcticDEM/tile_zarrs/<tile>/...) names its subfolders
+# differently per tile, so pass base_dir/subfolder explicitly to use it.
+TILE_ZARR_BASE = "/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/temp/filled_arrays"
+TILE_ZARR_SUBFOLDER = "zarr_coreg_cs2_v_999_dh_999_vertical_offset_mean_nuthkaab_deramp"
 
 
 def get_tile_zarr_dir(tile_id, base_dir=TILE_ZARR_BASE, subfolder=TILE_ZARR_SUBFOLDER):
@@ -164,9 +167,6 @@ def build_strip_index(tile_id, base_dir=TILE_ZARR_BASE, subfolder=TILE_ZARR_SUBF
     date (different catalog IDs); keep all of them, filtering happens later.
     """
     tile_dir = get_tile_zarr_dir(tile_id, base_dir, subfolder)
-    # For files that are not in the standard zarr directory structure, you can specify the tile_dir directly:
-    # tile_dir='/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/temp/filled_arrays/16_39_1_1/zarr_coreg_cs2_v_999_dh_999_vertical_offset_mean_nuthkaab_deramp/'
-    tile_dir='/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/temp/filled_arrays/12_39_1_1/zarr_coreg_cs2_v_999_dh_999_vertical_offset_mean_nuthkaab_deramp/'
     strip_index = {}
     for entry in os.scandir(tile_dir):
         if not (entry.is_dir() and entry.name.endswith(".zarr")):
@@ -268,8 +268,12 @@ def zarr_path_from_pairname(tile_id, pairname, base_dir=TILE_ZARR_BASE,
     actually has valid data at the site (it's literally where that history
     row's elevation value came from).
     """
-    return os.path.join(get_tile_zarr_dir(tile_id, base_dir, subfolder),
-                         f"processed_{pairname}_dt.zarr")
+    tile_dir = get_tile_zarr_dir(tile_id, base_dir, subfolder)
+    for name in (f"processed_{pairname}.zarr", f"processed_{pairname}_dt.zarr"):
+        path = os.path.join(tile_dir, name)
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(f"No zarr for {pairname} in {tile_dir}")
 
 
 def validate_georeferencing(zarr_path, tile_id, site_lon, site_lat,
@@ -908,8 +912,13 @@ def plot_polygon_timeseries(ts_df, window=None, output_path=None, lake_name=None
     """
     df = ts_df.copy()
     df["date"] = pd.to_datetime(df["date"])
+    # Filename years come from the input selection (the window, or the full
+    # series), not from whatever survives the outlier cut below
     if window is not None:
+        years = f"{pd.Timestamp(window[0]).year}-{pd.Timestamp(window[1]).year}"
         df = df[(df["date"] >= window[0]) & (df["date"] <= window[1])]
+    else:
+        years = f"{df['date'].min().year}-{df['date'].max().year}"
     df = df.sort_values("date").reset_index(drop=True)
  
     if use_corrected:
@@ -969,7 +978,6 @@ def plot_polygon_timeseries(ts_df, window=None, output_path=None, lake_name=None
     plt.tight_layout()
  
     if output_path is None:
-        years = f"{df['date'].iloc[0].year}-{df['date'].iloc[-1].year}"
         name_slug = lake_name or "site"
         output_path = f"polygons/polygon_elevation_history_{name_slug}_{years}.png"
     fig.savefig(output_path, dpi=150, bbox_inches="tight")

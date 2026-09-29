@@ -18,13 +18,12 @@ from pyproj import Transformer
 
 # Import utilities
 from elevation_utils import (
-    wgs84_to_3413, find_and_unzip, get_elevation_window,
-    read_elevation_from_compressed, extract_elevation_profile, 
-    extract_elevation_profile_compressed, transect_from_mosaic
+    wgs84_to_3413, get_elevation_window, extract_elevation_profile,
+    transect_from_mosaic, open_dem
 )
 from analysis import (
     extract_date_obj, extract_date_label, extract_year,
-    filter_outlier_profiles, process_elevation_profiles
+    filter_outlier_profiles, process_elevation_profiles, _profiles_year_span
 )
 from config import (
     OUTPUT_DIR, DEFAULT_NUM_SAMPLES, DEFAULT_WINDOW_SIZE,
@@ -426,12 +425,10 @@ def plot_lake_detection_results(all_profiles, lake_results, coreg_mode,
         gs_map_bottom = gs[1, 0]
         gs_profiles = gs[:, 1]
 
-    # Get DEM file
+    # Coregistered GeoTIFF, or strip tarball read in memory
     demfile = raster_metadata["path"]
-    if not os.path.exists(demfile):
-        demfile = find_and_unzip(demfile)
     
-    with rio.open(demfile) as src:
+    with open_dem(demfile) as src:
         # Calculate window with margin
         margin = margin_km * 1000
         min_x, max_x = min(x0, x1) - margin, max(x0, x1) + margin
@@ -662,8 +659,7 @@ def plot_lake_detection_results(all_profiles, lake_results, coreg_mode,
     xs, ys = coords[0]
     xe, ye = coords[1]
     
-    yearstart = extract_year(all_profiles["profiles"][-1]["metadata"]["dem_name"])
-    yearend = extract_year(all_profiles["profiles"][0]["metadata"]["dem_name"])
+    yearstart, yearend = _profiles_year_span(all_profiles)
     
     if lake_name:
         output_path = get_output_path('transects_combined',

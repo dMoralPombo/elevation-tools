@@ -29,13 +29,12 @@ from scipy.ndimage import label as nd_label
 
 # Import utilities
 from elevation_utils import (
-    wgs84_to_3413, find_and_unzip, get_elevation_window,
-    read_elevation_from_compressed, extract_elevation_profile, 
-    extract_elevation_profile_compressed, transect_from_mosaic
+    wgs84_to_3413, get_elevation_window, extract_elevation_profile,
+    transect_from_mosaic, find_strip_file, open_dem
 )
 from config import (
     OUTPUT_DIR, DEFAULT_NUM_SAMPLES, DEFAULT_WINDOW_SIZE,
-    DEFAULT_WINDOW_TYPE, COREG_PARAMS, get_output_path
+    DEFAULT_WINDOW_TYPE, get_output_path
 )
 
 # ============================================================================
@@ -150,16 +149,76 @@ def extract_date_obj(dem_name):
     # Fallback
     return datetime(2000, 1, 1)
 
+
+def year_span(time_range=None, dates=None):
+    """Start and end years used in output filenames.
+
+    Taken from the input selection -- the requested "YYYY-MM-DD/YYYY-MM-DD"
+    range if given, otherwise the span of the input DEM dates -- never from
+    what survives outlier filtering, so all outputs of a run share the same
+    years.
+
+    Parameters
+    ----------
+    time_range : str, optional
+        "YYYY-MM-DD/YYYY-MM-DD"
+    dates : list of datetime or int, optional
+        Input DEM dates (or years), used when time_range is None
+
+    Returns
+    -------
+    tuple
+        (start_year, end_year), or (0, 0) if nothing to go on
+    """
+    if time_range:
+        start, end = time_range.split("/")
+        return int(start[:4]), int(end[:4])
+    years = [d.year if hasattr(d, "year") else int(d) for d in (dates or [])]
+    years = [y for y in years if y]
+    return (min(years), max(years)) if years else (0, 0)
+
+
+def _profiles_year_span(all_profiles):
+    """Year span stored by process_elevation_profiles(), or derived from the
+    profiles themselves for dicts created before it was recorded."""
+    if all_profiles.get("year_span"):
+        return all_profiles["year_span"]
+    return year_span(dates=[extract_year(p["metadata"]["dem_name"])
+                            for p in all_profiles["profiles"]])
+
 # ============================================================================
 # ELEVATION HISTORY PROCESSING
 # ============================================================================
+
+def _sample_strip(archdir, geocell, strip, coreg_mode, x, y, window_size, window_type):
+    """Window statistics at (x, y) EPSG:3413 for one strip.
+
+    Returns (mean, std, valid_count, path); NaNs and path None/error text when
+    no file matches or reading fails.
+    """
+    path = find_strip_file(archdir, geocell, strip, coreg_mode)
+    if path is None:
+        print(f"  No {coreg_mode} file for {strip} in {geocell}, skipping")
+        return np.nan, np.nan, 0, None
+    try:
+        with open_dem(path) as src:
+            mean_elev, std_elev, valid_count = get_elevation_window(
+                src, x, y, window_size, window_type
+            )
+    except Exception as e:
+        print(f"  Error reading {os.path.basename(path)}: {e}")
+        return np.nan, np.nan, 0, path
+    return mean_elev, std_elev, valid_count, path
+
 
 def process_elevation_history(
     geocells, pairnames, dates, archdir, coords,
     window_size=DEFAULT_WINDOW_SIZE,
     window_type=DEFAULT_WINDOW_TYPE,
     coreg_mode="none",
-    lake_name=None
+    lake_name=None,
+    time_range=None,
+    strip_ids=None
 ):
     """Track elevation values at a point across multiple DEMs.
     
@@ -176,6 +235,11 @@ def process_elevation_history(
         'none', 'altim', or 'mosaic'
     lake_name : str, optional
         Name for plot titles
+    time_range : str, optional
+        Requested "YYYY-MM-DD/YYYY-MM-DD" range, recorded for output filenames
+    strip_ids : list, optional
+        STAC item ids (elevation_utils.get_strip_ids), which pin the strip
+        segment; defaults to pairnames
         
     Returns
     -------
@@ -199,46 +263,19 @@ def process_elevation_history(
         'dates': [], 'pairnames': [], 'metadata': [],
         'coords_4326': coords, 'coords_3413': coords_3413,
         'window_size': window_size, 'window_type': window_type,
-        'lake_name': lake_name
+        'lake_name': lake_name,
+        'year_span': year_span(time_range, date_objs),
     }
 
-    # Build coregistration suffix
-    if coreg_mode != 'none':
-        params = COREG_PARAMS.get(coreg_mode, {})
-        ref = params.get('reference_data', 'unknown')
-        vel = params.get('filter_vel', '0')
-        dhdt = params.get('filter_dhdt', '0')
-        suffix = f"_{ref}_v_{vel}-0_dh_{dhdt}-0"
-    else:
-        suffix = ""
+    strips = strip_ids or pairnames
     
     # Process each DEM
     for i, (geocell, pairname) in enumerate(zip(geocells, pairnames)):
         print(f"\nProcessing {i+1}/{len(pairnames)}: {pairname}")
         
-        if coreg_mode == 'none':
-            # Use compressed files
-            raster_path = os.path.join(
-                archdir,
-                f"{geocell}/SETSM_s2s041_{pairname}_2m_lsf_seg1_dem.tif"
-            )
-            mean_elev, std_elev, valid_count = read_elevation_from_compressed(
-                raster_path, x, y, window_size, window_type
-            )
-        else:
-            # Use coregistered files
-            base_dir = os.path.join(archdir, geocell)
-            pattern = f"SETSM_s2s041_{pairname}_2m_lsf_seg1_dem*{suffix}*coregistered.tif"
-            matches = glob.glob(os.path.join(base_dir, pattern))
-            
-            if matches:
-                with rio.open(matches[0]) as src:
-                    mean_elev, std_elev, valid_count = get_elevation_window(
-                        src, x, y, window_size, window_type
-                    )
-            else:
-                print(f"  No coregistered file found in \n {os.path.join(base_dir, pattern)}, skipping")
-                mean_elev, std_elev, valid_count = np.nan, np.nan, 0
+        mean_elev, std_elev, valid_count, raster_path = _sample_strip(
+            archdir, geocell, strips[i], coreg_mode, x, y, window_size, window_type
+        )
 
         # Store results
         history['elevations'].append(mean_elev)
@@ -248,6 +285,7 @@ def process_elevation_history(
         history['pairnames'].append(pairname)
         history['metadata'].append({
             'geocell': geocell,
+            'path': raster_path,
             'valid': not np.isnan(mean_elev),
             'valid_pixels': valid_count,
             'std': std_elev,
@@ -296,7 +334,8 @@ def process_elevation_history(
 
 def process_elevation_profiles(
     transect_coords, pairnames, geocells, archdir,
-    num_samples=DEFAULT_NUM_SAMPLES, coreg_mode='none'
+    num_samples=DEFAULT_NUM_SAMPLES, coreg_mode='none', time_range=None,
+    strip_ids=None
 ):
     """Extract elevation profiles from multiple DEMs along a transect.
     
@@ -312,6 +351,11 @@ def process_elevation_profiles(
         Points along transect
     coreg_mode : str
         'none', 'altim', or 'mosaic'
+    time_range : str, optional
+        Requested "YYYY-MM-DD/YYYY-MM-DD" range, recorded for output filenames
+    strip_ids : list, optional
+        STAC item ids (elevation_utils.get_strip_ids), which pin the strip
+        segment; defaults to pairnames
         
     Returns
     -------
@@ -322,6 +366,7 @@ def process_elevation_profiles(
         'transect_coords': transect_coords,
         'profiles': [],
         'mosaic': None,
+        'year_span': year_span(time_range, [extract_year(p) for p in pairnames]),
     }
 
     # Add the mosaic transect first, if available
@@ -337,43 +382,21 @@ def process_elevation_profiles(
     if profile_mosaic is not None:
         print("Mosaic profile extracted successfully.")
 
-    # Build suffix for coregistered files
-    if coreg_mode != 'none':
-        params = COREG_PARAMS.get(coreg_mode, {})
-        ref = params.get('reference_data', 'unknown')
-        vel = params.get('filter_vel', '0')
-        dhdt = params.get('filter_dhdt', '0')
-        suffix = f"_{ref}_v_{vel}-0_dh_{dhdt}-0"
-    else:
-        suffix = ""
+    strips = strip_ids or pairnames
     
     print(f"\nProcessing {len(pairnames)} DEMs for elevation profiles...")
     
     for i, (pairname, geocell) in enumerate(tqdm(zip(pairnames, geocells), 
                                                    total=len(pairnames))):
         try:
-            if coreg_mode == 'none':
-                raster_path = os.path.join(
-                    archdir,
-                    f"{geocell}/SETSM_s2s041_{pairname}_2m_lsf_seg1_dem.tif"
-                )
-                dem_name = f"SETSM_{pairname}"
-                transect, elevations, distance, x0, y0, x1, y1 = \
-                    extract_elevation_profile_compressed(transect_coords, raster_path, num_samples)
-            else:
-                raster_path = os.path.join(
-                    archdir,
-                    f"{geocell}/SETSM_s2s041_{pairname}_2m_*_dem{suffix}*_coregistered.tif"
-                )
-                # raster_path should have a wildcard after suffix, so we need to find the actual file
-                raster_files = glob.glob(raster_path)
-                if not raster_files:
-                    print(f"No coregistered files found for {pairname}")
-                    continue
-                raster_path = raster_files[0]
-                dem_name = f"SETSM_{pairname}"
-                transect, elevations, distance, x0, y0, x1, y1 = \
-                    extract_elevation_profile(transect_coords, raster_path, num_samples)
+            # Tarball (read in memory) for 'none', coregistered GeoTIFF otherwise
+            raster_path = find_strip_file(archdir, geocell, strips[i], coreg_mode)
+            if raster_path is None:
+                print(f"No {coreg_mode} file found for {strips[i]}")
+                continue
+            dem_name = f"SETSM_{pairname}"
+            transect, elevations, distance, x0, y0, x1, y1 = \
+                extract_elevation_profile(transect_coords, raster_path, num_samples)
 
             all_profiles['profiles'].append({
                 'transect': transect,
@@ -632,13 +655,14 @@ def plot_elevation_history(history, output_path=None, coreg_mode='none', lake_na
         print("No valid data to plot")
         return None
     
-    # Remove outliers
+    # Remove outliers (std is undefined for a single value)
     median = valid_df['elevation'].median()
     std = valid_df['elevation'].std()
-    valid_df = valid_df.filter(
-        (pl.col('elevation') <= median + 2 * std) &
-        (pl.col('elevation') >= median - 2 * std)
-    )
+    if std is not None:
+        valid_df = valid_df.filter(
+            (pl.col('elevation') <= median + 2 * std) &
+            (pl.col('elevation') >= median - 2 * std)
+        )
     
     valid_pd = valid_df.to_pandas()
     window_size = history.get('window_size', 3)
@@ -695,7 +719,8 @@ def plot_elevation_history(history, output_path=None, coreg_mode='none', lake_na
     plt.tight_layout()
     
     # Save
-    years = f"{valid_pd['date'].iloc[0].year}-{valid_pd['date'].iloc[-1].year}"
+    y0, y1 = history.get('year_span') or year_span(dates=history['dates'])
+    years = f"{y0}-{y1}"
     # output_path = get_output_path(
     #     'elevation_histories',
     #     f"elevation_history_{coords[0]:.3f}_{coords[1]:.3f}_{coreg_mode}_{years}.png"
@@ -750,15 +775,10 @@ def plot_combined_profiles(all_profiles, coreg_mode='none', cmap='terrain', lake
     gs = fig.add_gridspec(2, 2, width_ratios=[1, 2], height_ratios=[1, 1], 
                          wspace=0.32, hspace=0.22)
 
-    # Get DEM file - use the path directly since it's already a file path for coregistered DEMs
+    # Coregistered GeoTIFF, or strip tarball read in memory
     demfile = raster_metadata["path"]
-    
-    # For compressed DEMs, we might need to handle them differently
-    if not os.path.exists(demfile): # and '.gz' in demfile:
-        # Try to find the uncompressed version or handle compressed
-        demfile = find_and_unzip(demfile)
 
-    with rio.open(demfile) as src:
+    with open_dem(demfile) as src:
         # Calculate the bounding box with margin
         margin = margin_km * 1000  # meters
         min_x, max_x = min(x0, x1) - margin, max(x0, x1) + margin
@@ -991,8 +1011,7 @@ def plot_combined_profiles(all_profiles, coreg_mode='none', cmap='terrain', lake
     xe, ye = coords_4326[1]
     # yearstart = all_profiles["profiles"][-1]["metadata"]["dem_name"].split("_")[1][:4]
     # yearend = all_profiles["profiles"][0]["metadata"]["dem_name"].split("_")[1][:4]
-    yearstart = extract_year(all_profiles["profiles"][-1]["metadata"]["dem_name"])
-    yearend = extract_year(all_profiles["profiles"][0]["metadata"]["dem_name"])
+    yearstart, yearend = _profiles_year_span(all_profiles)
 
     # Define output name
     output_path = OUTPUT_DIR
@@ -1195,8 +1214,7 @@ def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, 
         f"diff_heatmap_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}.png")
     os.makedirs(os.path.dirname(output_name), exist_ok=True)
 
-    yearstart = extract_year(all_profiles["profiles"][-1]["metadata"]["dem_name"])
-    yearend = extract_year(all_profiles["profiles"][0]["metadata"]["dem_name"])
+    yearstart, yearend = _profiles_year_span(all_profiles)
 
     if lake_name is not None:
         output_name = os.path.join(output_path, "transects_combined", 
@@ -1917,8 +1935,7 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
         xs, ys = coords[0] if len(coords) > 0 else (0, 0)
         xe, ye = coords[1] if len(coords) > 1 else (0, 0)
             
-        yearstart = extract_year(all_profiles["profiles"][-1]["metadata"]["dem_name"])
-        yearend = extract_year(all_profiles["profiles"][0]["metadata"]["dem_name"])
+        yearstart, yearend = _profiles_year_span(all_profiles)
 
         if lake_name is not None:
             output_name = os.path.join(output_path, "transects_combined", 
@@ -1966,7 +1983,7 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     dict
         Elevation history results
     """
-    from elevation_utils import search_arcticdem_strips, filter_strip_dems, get_dem_metadata
+    from elevation_utils import search_arcticdem_strips, filter_strip_dems, get_dem_metadata, get_strip_ids
     
     if output_path is None:
         output_path = os.path.join(OUTPUT_DIR, 'elevation_histories')
@@ -1993,7 +2010,8 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     history = process_elevation_history(
         geocells, pairnames, dates, archdir, coords,
         window_size=window_size, window_type=window_type,
-        coreg_mode=coreg_mode
+        coreg_mode=coreg_mode, time_range=time_range,
+        strip_ids=get_strip_ids(items_gdf)
     )
     
     # Plot
@@ -2002,8 +2020,7 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     history['plot_path'] = plot_path
     
     # Save data
-    year_i = time_range[:4]
-    year_f = time_range[-10:-6] if '/' in time_range else time_range[-4:]
+    year_i, year_f = history['year_span']
     
     if coreg_mode == 'none':
         suf = '_none'
@@ -2066,7 +2083,7 @@ def run_transect_analysis(archdir, output_path=None, coreg_mode='none',
     dict
         All profile data and plot paths
     """
-    from elevation_utils import search_arcticdem_strips, filter_strip_dems, get_dem_metadata
+    from elevation_utils import search_arcticdem_strips, filter_strip_dems, get_dem_metadata, get_strip_ids
     
     if output_path is None:
         output_path = OUTPUT_DIR
@@ -2094,14 +2111,14 @@ def run_transect_analysis(archdir, output_path=None, coreg_mode='none',
     # Process profiles
     all_profiles = process_elevation_profiles(
         transect_coords, pairnames, geocells, archdir,
-        coreg_mode=coreg_mode
+        coreg_mode=coreg_mode, time_range=time_range,
+        strip_ids=get_strip_ids(items_gdf)
     )
     
     # Save data
     xs, ys = start
     xe, ye = end
-    year_start = time_range[:4]
-    year_end = time_range[-10:-6] if '/' in time_range else time_range[-4:]
+    year_start, year_end = all_profiles['year_span']
     
     if lake_name:
         data_path = get_output_path(
@@ -2316,10 +2333,8 @@ def verify_coordinate_transforms(all_profiles, margin_km=2):
     transect_coords = all_profiles["transect_coords"]
     
     demfile = raster_metadata["path"]
-    if not os.path.exists(demfile):
-        demfile = find_and_unzip(demfile)
     
-    with rio.open(demfile) as src:
+    with open_dem(demfile) as src:
         margin = margin_km * 1000
         min_x = min(x0, x1) - margin
         max_x = max(x0, x1) + margin
@@ -2527,41 +2542,9 @@ def verify_coordinate_transforms(all_profiles, margin_km=2):
         print("  - Secondary axis labels (top/right) should match cyan labels")
 
 
-def batch_process_elevation_histories_gz(
-    geocells,
-    pairnames,
-    dates,
-    coords,
-    archdir,
-    output_path=None,
-    window_size=DEFAULT_WINDOW_SIZE,
-    window_type=DEFAULT_WINDOW_TYPE,
-):
-    """Track elevation values at a point across multiple DEMs from compressed files.
-    
-    Reads elevations directly from .tar.gz or .gz files without full extraction.
-    
-    Parameters
-    ----------
-    geocells, pairnames, dates : lists
-        DEM identifiers from STAC search
-    coords : tuple
-        (lon, lat) in WGS84
-    archdir : str
-        Archive directory path
-    output_path : str, optional
-        Output directory
-    window_size, window_type : as in get_elevation_window
-        
-    Returns
-    -------
-    dict
-        Elevation history data
-    """
-    if output_path is None:
-        output_path = OUTPUT_DIR
-    
-    print(f"\n=== Processing elevation history from compressed files ===")
+def _batch_history(geocells, pairnames, dates, coords, archdir, coreg_mode,
+                   window_size, window_type, time_range, strip_ids):
+    """Shared loop for the batch elevation-history functions."""
     print(f"DEMs: {len(pairnames)}")
     print(f"Window: {window_size}x{window_size} {window_type}")
     
@@ -2593,51 +2576,81 @@ def batch_process_elevation_histories_gz(
         'coords_3413': coords_3413,
         'window_size': window_size,
         'window_type': window_type,
+        'year_span': year_span(time_range, date_objs),
+        'coreg_mode': coreg_mode,
     }
+    strips = strip_ids or pairnames
     
     # Process each DEM
     for i, (geocell, pairname) in enumerate(zip(geocells, pairnames)):
-        raster_path = os.path.join(
-            archdir,
-            f"{geocell}/SETSM_s2s041_{pairname}_2m_lsf_seg1_dem.tif"
+        mean_elev, std_elev, valid_count, raster_path = _sample_strip(
+            archdir, geocell, strips[i], coreg_mode, x, y, window_size, window_type
         )
+        history['elevations'].append(mean_elev)
+        history['elevations_std'].append(std_elev)
+        history['valid_pixels'].append(valid_count)
+        history['dates'].append(date_objs[i])
+        history['pairnames'].append(pairname)
+        history['metadata'].append({
+            'geocell': geocell,
+            'path': raster_path,
+            'valid': not np.isnan(mean_elev),
+            'valid_pixels': valid_count,
+            'std': std_elev,
+        })
         
-        try:
-            mean_elev, std_elev, valid_count = read_elevation_from_compressed(
-                raster_path, x, y, window_size, window_type
-            )
-            
-            history['elevations'].append(mean_elev)
-            history['elevations_std'].append(std_elev)
-            history['valid_pixels'].append(valid_count)
-            history['dates'].append(date_objs[i])
-            history['pairnames'].append(pairname)
-            history['metadata'].append({
-                'geocell': geocell,
-                'path': raster_path,
-                'valid': not np.isnan(mean_elev),
-                'valid_pixels': valid_count,
-                'std': std_elev,
-            })
-            
-            if (i + 1) % 50 == 0 or i == len(pairnames) - 1:
-                print(f"  Processed {i+1}/{len(pairnames)}: "
-                      f"{sum(1 for m in history['metadata'] if m.get('valid', False))} valid")
-                
-        except Exception as e:
-            print(f"  Error processing {pairname}: {e}")
-            history['elevations'].append(np.nan)
-            history['elevations_std'].append(np.nan)
-            history['valid_pixels'].append(0)
-            history['dates'].append(date_objs[i])
-            history['pairnames'].append(pairname)
-            history['metadata'].append({'error': str(e), 'valid': False})
+        if (i + 1) % 50 == 0 or i == len(pairnames) - 1:
+            print(f"  Processed {i+1}/{len(pairnames)}: "
+                  f"{sum(1 for m in history['metadata'] if m.get('valid', False))} valid")
     
     # Summary
     valid_count = sum(1 for m in history['metadata'] if m.get('valid', False))
     print(f"\n✓ Complete: {valid_count}/{len(pairnames)} valid elevations")
     
     return history
+
+
+def batch_process_elevation_histories_gz(
+    geocells,
+    pairnames,
+    dates,
+    coords,
+    archdir,
+    output_path=None,
+    window_size=DEFAULT_WINDOW_SIZE,
+    window_type=DEFAULT_WINDOW_TYPE,
+    time_range=None,
+    strip_ids=None,
+):
+    """Track elevation values at a point across multiple DEMs from compressed files.
+    
+    Reads elevations directly from the strip .tar.gz files, in memory.
+    
+    Parameters
+    ----------
+    geocells, pairnames, dates : lists
+        DEM identifiers from STAC search
+    coords : tuple
+        (lon, lat) in WGS84
+    archdir : str
+        Archive directory path
+    output_path : str, optional
+        Unused, kept for compatibility
+    window_size, window_type : as in get_elevation_window
+    time_range : str, optional
+        Requested "YYYY-MM-DD/YYYY-MM-DD" range, recorded for output filenames
+    strip_ids : list, optional
+        STAC item ids (elevation_utils.get_strip_ids), which pin the strip
+        segment; defaults to pairnames
+        
+    Returns
+    -------
+    dict
+        Elevation history data
+    """
+    print(f"\n=== Processing elevation history from compressed files ===")
+    return _batch_history(geocells, pairnames, dates, coords, archdir, 'none',
+                          window_size, window_type, time_range, strip_ids)
 
 
 def batch_process_elevation_histories_coregistered(
@@ -2650,6 +2663,8 @@ def batch_process_elevation_histories_coregistered(
     coreg_mode="altim",
     window_size=DEFAULT_WINDOW_SIZE,
     window_type=DEFAULT_WINDOW_TYPE,
+    time_range=None,
+    strip_ids=None,
 ):
     """Track elevation values at a point across multiple coregistered DEMs.
     
@@ -2662,133 +2677,21 @@ def batch_process_elevation_histories_coregistered(
     archdir : str
         Archive directory path
     output_path : str, optional
-        Output directory
+        Unused, kept for compatibility
     coreg_mode : str
-        'altim' or 'mosaic'
+        'altim' or 'mosaic'; the file suffix comes from COREG_PARAMS
     window_size, window_type : as in get_elevation_window
+    time_range : str, optional
+        Requested "YYYY-MM-DD/YYYY-MM-DD" range, recorded for output filenames
+    strip_ids : list, optional
+        STAC item ids (elevation_utils.get_strip_ids), which pin the strip
+        segment; defaults to pairnames
         
     Returns
     -------
     dict
         Elevation history data
     """
-    if output_path is None:
-        output_path = OUTPUT_DIR
-    
-    # Build coregistration suffix
-    if coreg_mode != 'none':
-        params = COREG_PARAMS.get(coreg_mode, {})
-        ref = params.get('reference_data', coreg_mode)
-        vel = params.get('filter_vel', '0')
-        dhdt = params.get('filter_dhdt', '0')
-        coreg_choice = params.get('coreg_choice', 'vertical_offset_mean nuthkaab deramp')
-        coreg_choice_cl = "_".join(coreg_choice.split())
-        suffix = f"_{ref}_v_{vel}-0_dh_{dhdt}-0000_['vertical_offset_mean', 'nuthkaab', 'deramp']"
-    else:
-        suffix = ""
-    
     print(f"\n=== Processing elevation history ({coreg_mode} coregistered) ===")
-    print(f"DEMs: {len(pairnames)}")
-    print(f"Window: {window_size}x{window_size} {window_type}")
-    print(f"Coreg suffix: {suffix[:50]}...")
-    
-    # Transform coordinates
-    coords_3413 = wgs84_to_3413(*coords)
-    x, y = coords_3413
-    print(f"Coordinates (EPSG:3413): {x:.1f}, {y:.1f}")
-    
-    # Parse dates
-    date_objs = []
-    for d in dates:
-        try:
-            date_objs.append(datetime.strptime(d, "%Y-%m-%dT%H:%M:%SZ"))
-        except:
-            try:
-                date_objs.append(datetime.strptime(d, "%Y-%m-%d"))
-            except:
-                date_objs.append(datetime(2000, 1, 1))
-    
-    # Initialize storage
-    history = {
-        'elevations': [],
-        'elevations_std': [],
-        'valid_pixels': [],
-        'dates': [],
-        'pairnames': [],
-        'metadata': [],
-        'coords_4326': coords,
-        'coords_3413': coords_3413,
-        'window_size': window_size,
-        'window_type': window_type,
-        'coreg_mode': coreg_mode,
-    }
-    
-    # Process each DEM
-    for i, (geocell, pairname) in enumerate(zip(geocells, pairnames)):
-        # Build path to coregistered file
-        base_dir = os.path.join(archdir, geocell)
-        
-        # Try different patterns for coregistered files
-        patterns = [
-            f"SETSM_s2s041_{pairname}_2m_lsf_seg1_dem{suffix}_coregistered.tif",
-            f"SETSM_s2s041_{pairname}_2m_lsf_seg1_dem*{coreg_mode}*coregistered.tif",
-        ]
-        
-        raster_path = None
-        for pattern in patterns:
-            matches = glob.glob(os.path.join(base_dir, pattern))
-            if matches:
-                raster_path = matches[0]
-                break
-        
-        if raster_path is None:
-            print(f"  {i+1}/{len(pairnames)}: {pairname[:30]}... - no coregistered file found\nfor patterns like {base_dir}/{patterns[0]}")
-            history['elevations'].append(np.nan)
-            history['elevations_std'].append(np.nan)
-            history['valid_pixels'].append(0)
-            history['dates'].append(date_objs[i])
-            history['pairnames'].append(pairname)
-            history['metadata'].append({
-                'geocell': geocell,
-                'valid': False,
-                'error': 'No coregistered file found',
-            })
-            continue
-        
-        try:
-            with rio.open(raster_path) as src:
-                mean_elev, std_elev, valid_count = get_elevation_window(
-                    src, x, y, window_size, window_type
-                )
-            
-            history['elevations'].append(mean_elev)
-            history['elevations_std'].append(std_elev)
-            history['valid_pixels'].append(valid_count)
-            history['dates'].append(date_objs[i])
-            history['pairnames'].append(pairname)
-            history['metadata'].append({
-                'geocell': geocell,
-                'path': raster_path,
-                'valid': not np.isnan(mean_elev),
-                'valid_pixels': valid_count,
-                'std': std_elev,
-            })
-            
-            if (i + 1) % 50 == 0 or i == len(pairnames) - 1:
-                print(f"  Processed {i+1}/{len(pairnames)}: "
-                      f"{sum(1 for m in history['metadata'] if m.get('valid', False))} valid")
-                
-        except Exception as e:
-            print(f"  Error processing {pairname}: {e}")
-            history['elevations'].append(np.nan)
-            history['elevations_std'].append(np.nan)
-            history['valid_pixels'].append(0)
-            history['dates'].append(date_objs[i])
-            history['pairnames'].append(pairname)
-            history['metadata'].append({'error': str(e), 'valid': False})
-    
-    # Summary
-    valid_count = sum(1 for m in history['metadata'] if m.get('valid', False))
-    print(f"\n✓ Complete: {valid_count}/{len(pairnames)} valid elevations")
-    
-    return history
+    return _batch_history(geocells, pairnames, dates, coords, archdir, coreg_mode,
+                          window_size, window_type, time_range, strip_ids)

@@ -554,7 +554,8 @@ def plot_elevation_difference(
     crop_threshold : float
         Fraction of total size below which cropping triggers
     extent : tuple or None
-        (left, right, bottom, top) - auto-detected from metadata if None
+        (left, bottom, right, top) in EPSG:3413 metres, i.e. rasterio bounds
+        order - auto-detected from metadata if None
     shp_path : str, optional
         Path to shapefile for overlay
     shp_style : dict, optional
@@ -591,7 +592,7 @@ def plot_elevation_difference(
     if extent is None and metadata is not None:
         bounds = metadata.get('bounds')
         if bounds:
-            extent = (bounds[0], bounds[1], bounds[2], bounds[3])
+            extent = tuple(bounds)  # (left, bottom, right, top)
     
     # Find valid region
     valid_rows, valid_cols = np.where(valid_mask)
@@ -637,9 +638,9 @@ def plot_elevation_difference(
             pixel_height = (top - bottom) / total_height
             extent = (
                 left + crop_col_min * pixel_width,
+                top - crop_row_max * pixel_height,
                 left + crop_col_max * pixel_width,
-                bottom + (total_height - crop_row_max) * pixel_height,
-                bottom + (total_height - crop_row_min) * pixel_height,
+                top - crop_row_min * pixel_height,
             )
     else:
         raster_data = diff_masked.copy()
@@ -661,12 +662,13 @@ def plot_elevation_difference(
         print(f"  Downsampled {downsample_factor}x: "
               f"{plot_width}×{plot_height} → {raster_ds.shape[1]}×{raster_ds.shape[0]}")
         
-        # Adjust extent for downsampling
+        # Adjust extent for the rows/cols trimmed off the right and bottom
         if extent is not None:
             left, bottom, right, top = extent
-            extent = (left, bottom, 
-                     left + (right - left) * (w_new / plot_width),
-                     bottom + (top - bottom) * (h_new / plot_height))
+            extent = (left,
+                      top - (top - bottom) * (h_new * downsample_factor / plot_height),
+                      left + (right - left) * (w_new * downsample_factor / plot_width),
+                      top)
     else:
         raster_ds = raster_data
     
@@ -691,8 +693,8 @@ def plot_elevation_difference(
     interpolation = "bilinear" if downsample_factor > 1 else "nearest"
     
     if extent is not None:
-        left, right, bottom, top = extent
-        plot_extent = (left, right, bottom, top)
+        left, bottom, right, top = extent
+        plot_extent = (left, right, bottom, top)  # imshow order
     else:
         plot_extent = (0, plot_width, 0, plot_height)
     
@@ -704,7 +706,7 @@ def plot_elevation_difference(
     
     # Axis labels
     if extent is not None:
-        left, right, bottom, top = extent
+        left, bottom, right, top = extent
         x_ticks, y_ticks, lon_ticks, lat_ticks = _secondary_axis_labels(
             left, right, bottom, top
         )
