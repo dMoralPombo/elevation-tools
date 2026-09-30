@@ -53,7 +53,7 @@ GEOGRAPHIC_CRS = "EPSG:4326"   # WGS84
 # PROCESSING PARAMETERS
 # ============================================================================
 
-DEFAULT_NUM_SAMPLES = 100      # Points along transect
+DEFAULT_NUM_SAMPLES = 800      # Points along transect
 DEFAULT_WINDOW_SIZE = 3        # Window size for elevation extraction
 DEFAULT_WINDOW_TYPE = 'square' # 'square' or 'cross'
 MAX_CLOUD_COVER = 0.2          # Maximum cloud area percentage (0-1)
