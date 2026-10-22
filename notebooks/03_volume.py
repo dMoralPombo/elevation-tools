@@ -159,6 +159,29 @@ STRIP_DATE_PATTERN = re.compile(r"processed_[A-Za-z0-9]+_(\d{8})_")
 
 TILE_ZARR_BASE = "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/tile_zarrs"
 MEGATILE_SUBDIR = "megatile"  # tile_zarrs/megatile/<tile_id>_<cs2|mosaic>, kept with outliers
+# Stacks rebuilt after the October 2026 GLOBE fixes carry "_rs" (resampled
+# placement), e.g. cs2_..._deramp_rs_std30_mean20_outliersout_50m
+_RS_TAG_RX = re.compile(r"_rs(_|$)")
+# GLOBE's stacking logbook: one row per FINISHED stack (store_dir = its folder)
+STACK_LOGBOOK = "/home/moralpom/luna/CPOM/moralpom/globe/data/stacking_tracking.duckdb"
+
+
+def _finished_stack_dirs():
+    """
+    Folders of the stacks GLOBE has finished writing, from its DuckDB
+    logbook. A "_rs" folder not listed there is still being written (or
+    the run died), so it isn't used. Returns None if the logbook can't be
+    read (e.g. locked by a running stacking job).
+    """
+    try:
+        import duckdb
+        with duckdb.connect(STACK_LOGBOOK, read_only=True) as con:
+            rows = con.sql("SELECT store_dir FROM stack_runs").fetchall()
+        return {os.path.normpath(r[0]) for r in rows if r[0]}
+    except Exception as exc:
+        print(f"warning: can't read the stacking logbook ({exc}); "
+              f"can't tell finished _rs stacks from ones still being written")
+        return None
 
 # NOTE: the subfolder name is NOT consistent across tiles -- different tiles
 # have been processed with different reference/filtering pipelines, e.g.
@@ -182,8 +205,9 @@ def list_tile_zarr_subfolders(tile_id, base_dir=TILE_ZARR_BASE):
     (megatile/<tile_id>_<cs2|mosaic>), returned as "megatile/<name>" so the
     name can be passed on as a subfolder like any other. Those were made
     for a colleague and keep outliers (they match the "outliersin" stacks),
-    and they aren't updated when a tile is restacked. Empty folders and
-    folders flagged "incomplete" in their name are skipped.
+    and they aren't updated when a tile is restacked. Empty folders,
+    folders flagged "incomplete" in their name, and "_rs" stacks that
+    GLOBE's logbook doesn't list as finished are skipped.
     """
     def has_strips(path):
         return any(e.name.endswith(".zarr") for e in os.scandir(path))
@@ -196,10 +220,20 @@ def list_tile_zarr_subfolders(tile_id, base_dir=TILE_ZARR_BASE):
     if os.path.isdir(mega_dir):
         names += [f"{MEGATILE_SUBDIR}/{e.name}" for e in os.scandir(mega_dir)
                   if e.is_dir() and e.name.startswith(f"{tile_id}_")]
-    names = [n for n in names if "incomplete" not in n
-             and has_strips(os.path.join(base_dir, tile_id, n)
-                            if not n.startswith(f"{MEGATILE_SUBDIR}/")
-                            else os.path.join(base_dir, n))]
+    def path_of(n):
+        return (os.path.join(base_dir, n) if n.startswith(f"{MEGATILE_SUBDIR}/")
+                else os.path.join(base_dir, tile_id, n))
+
+    names = [n for n in names if "incomplete" not in n and has_strips(path_of(n))]
+    if any(_RS_TAG_RX.search(n) for n in names):
+        finished = _finished_stack_dirs()
+        if finished is not None:
+            unfinished = [n for n in names if _RS_TAG_RX.search(n)
+                          and os.path.normpath(path_of(n)) not in finished]
+            for n in unfinished:
+                print(f"note: skipping {tile_id}/{n}: not in the stacking "
+                      f"logbook, so still being written or unfinished")
+            names = [n for n in names if n not in unfinished]
     if not names:
         raise FileNotFoundError(f"No zarr stacks found for tile {tile_id} in "
                                 f"{tile_dir} or {mega_dir}")
@@ -215,6 +249,8 @@ def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE):
     1. "outliersout" (filters strips with SD > 50 m) is ALWAYS preferred
        over the equivalent non-outliersout variant of the same reference
        pipeline (cs2 or mosaic) -- collapsed automatically, no ambiguity.
+       Rebuilt "_rs" stacks come before older ones whatever their outlier
+       setting, since the older stacks predate the GLOBE stacking fixes.
        Then the tile's own folders, and the megatile copy (which keeps
        outliers) only when the tile folder has no stack of that reference.
     2. cs2 (CryoSat-2-referenced) vs mosaic (ArcticDEM-mosaic-referenced)
@@ -252,7 +288,8 @@ def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE):
 
     collapsed = []
     for ref, names in by_reference.items():
-        names = sorted(names, key=lambda n: ("outliersout" not in n,
+        names = sorted(names, key=lambda n: (not _RS_TAG_RX.search(n),
+                                             "outliersout" not in n,
                                              n.startswith(f"{MEGATILE_SUBDIR}/")))
         collapsed.append(names[0])
 
@@ -265,6 +302,9 @@ def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE):
                   f"referenced data used elsewhere. Results for this tile "
                   f"should be treated as lower-confidence unless a "
                   f"coregistered alternative genuinely doesn't exist.")
+        if not _RS_TAG_RX.search(chosen) and "nocoreg" not in chosen:
+            print(f"note: tile {tile_id} has no rebuilt (_rs) stack yet; "
+                  f"using the older {chosen}")
         if chosen.startswith(f"{MEGATILE_SUBDIR}/"):
             print(f"note: tile {tile_id} uses the megatile stack {chosen}, "
                   f"which keeps outliers (no outliersout stack exists)")
@@ -1946,12 +1986,18 @@ _ZARR_PAIR_RX = re.compile(r"^(?:processed_)+(?P<pair>.+?)(?:_dt)?\.zarr$")
 
 def _pair_key(name):
     """
-    Matching key between catalogue pairnames and zarr folder names: zarr
-    folders keep only <sensor>_<date>_<first catalogue ID>, e.g.
+    Matching key between catalogue pairnames and zarr folder names: older
+    zarr folders keep only <sensor>_<date>_<first catalogue ID>, e.g.
     processed_W1W1_20180223_10200100717B9C00_dt.zarr for pairname
-    W1W1_20180223_10200100717B9C00_<second ID>.
+    W1W1_20180223_10200100717B9C00_<second ID>. Rebuilt (_rs) stacks keep
+    the full pairname, so match on that whenever the zarr name has it.
     """
     return "_".join(name.split("_")[:3])
+
+
+def _pair_in(pair, keys):
+    """True if catalogue pairname `pair` is in `keys` (full or short names)."""
+    return pair in keys or _pair_key(pair) in keys
 
 
 def coverage_gap_report(lake_gdf, tile_id, strip_index, ts_diag, subfolder=None,
@@ -1999,12 +2045,12 @@ def coverage_gap_report(lake_gdf, tile_id, strip_index, ts_diag, subfolder=None,
         for p in paths:
             m = _ZARR_PAIR_RX.match(os.path.basename(p))
             if m:
-                zarr_pairs[_pair_key(m["pair"])] = p
+                zarr_pairs[m["pair"]] = p
     kept_pairs = set()
     for _, r in ts_diag.iterrows():
         m = _ZARR_PAIR_RX.match(os.path.basename(r["path"]))
         if m and r["status"] == "kept":
-            kept_pairs.add(_pair_key(m["pair"]))
+            kept_pairs.add(m["pair"])
 
     rows = []
     for _, it in items_gdf.iterrows():
@@ -2016,8 +2062,8 @@ def coverage_gap_report(lake_gdf, tile_id, strip_index, ts_diag, subfolder=None,
             "cloud_fraction": it.get("pgc:cloud_area_percent", np.nan),
             "raw_in_archive": find_strip_file(ARCHIVE_DIR, geocell, sid, "none") is not None,
             "coreg_in_archive": find_strip_file(ARCHIVE_DIR, geocell, sid, ref) is not None,
-            "in_zarr": _pair_key(pair) in zarr_pairs,
-            "zarr_data_over_lake": _pair_key(pair) in kept_pairs,
+            "in_zarr": _pair_in(pair, zarr_pairs),
+            "zarr_data_over_lake": _pair_in(pair, kept_pairs),
         })
     strips_df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
 

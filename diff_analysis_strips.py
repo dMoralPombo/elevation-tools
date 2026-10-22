@@ -24,6 +24,7 @@ from pyproj import Transformer
 
 # Import shared utilities
 from config import OUTPUT_DIR, get_output_path
+from elevation_utils import locate_strip, coreg_mode_from_suffix, open_dem
 
 
 # ============================================================================
@@ -82,48 +83,27 @@ def format_date_label(date_obj):
 # ============================================================================
 
 def find_coregistered_dem(strip_name, archive_dir, coreg_suffix=None):
-    """Find a coregistered DEM file matching a strip name.
-    
+    """Find the archive file for a strip, by name (no geocell needed).
+
     Parameters
     ----------
     strip_name : str
-        Strip identifier (can be partial)
-    archive_dir : str
-        Base archive directory
+        Pairname or its start (e.g. 'WV02_20180326_103001007AC58F00'), or a
+        full STAC item id ('..._2m_lsf_seg1') to pin the segment.
+    archive_dir : str or None
+        Strip archive root; None uses config.ARCHIVE_DIR.
     coreg_suffix : str, optional
-        Suffix for coregistered files (e.g., '_mosaic_v_0-0_dh_0-0000_...')
-        If None, searches for any coregistered file.
-        
+        Coregistered-file suffix (COREG_SUFFIX in the notebooks, with or
+        without '_coregistered'); it must be one COREG_PARAMS defines. None
+        gives the raw strip, read with its bitmask applied.
+
     Returns
     -------
     str or None
-        Path to the found DEM file
+        Path to the file (open it with elevation_utils.open_dem)
     """
-    # Try different search patterns
-    patterns = []
-    
-    if coreg_suffix:
-        patterns.append(os.path.join(archive_dir, f"*{strip_name}*{coreg_suffix}*coregistered.tif"))
-        patterns.append(os.path.join(archive_dir, f"*{strip_name}*coregistered.tif"))
-    else:
-        patterns.append(os.path.join(archive_dir, f"*{strip_name}*coregistered.tif"))
-    
-    # Also try without coregistered suffix (for raw DEMs)
-    patterns.append(os.path.join(archive_dir, f"*{strip_name}*.tif"))
-    
-    for pattern in patterns:
-        matches = glob.glob(pattern)
-        if matches:
-            return matches[0]
-    
-    # Try recursive search
-    for pattern in patterns:
-        recursive_pattern = os.path.join(archive_dir, "**", os.path.basename(pattern))
-        matches = glob.glob(recursive_pattern, recursive=True)
-        if matches:
-            return matches[0]
-    
-    return None
+    return locate_strip(strip_name, coreg_mode_from_suffix(coreg_suffix),
+                        archive_dir)
 
 
 def compute_dem_difference_from_geotiffs(strip_a, strip_b, archive_dir, 
@@ -170,7 +150,7 @@ def compute_dem_difference_from_geotiffs(strip_a, strip_b, archive_dir,
     print(f"  DEM B: {os.path.basename(dem_path_b)[:60]}...")
     
     try:
-        with rio.open(dem_path_a) as src_a, rio.open(dem_path_b) as src_b:
+        with open_dem(dem_path_a) as src_a, open_dem(dem_path_b) as src_b:
             # Check if CRS matches
             if src_a.crs != src_b.crs:
                 print(f"  ⚠ CRS mismatch: {src_a.crs} vs {src_b.crs}")

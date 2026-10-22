@@ -8,6 +8,7 @@ Uses pre-computed zarr files for efficient processing.
 import gc
 import glob
 import os
+import re
 import sys
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict, Any
@@ -31,6 +32,7 @@ from matplotlib.path import Path as MplPath
 
 # Import shared utilities
 from config import OUTPUT_DIR, get_output_path
+from elevation_utils import locate_strip, coreg_mode_from_suffix, open_dem
 
 # ============================================================================
 # ZARR METADATA ANALYSIS
@@ -455,6 +457,35 @@ def overlay_shapefile(ax, shp_path, raster_crs="EPSG:3413", style=None):
 # FAST DIFFERENCE FROM ZARR FILES
 # ============================================================================
 
+def _find_strip_zarr(zarr_dir, strip):
+    """Path of a strip's zarr in a stack folder, or None.
+
+    Zarr names are processed_<pair>[_dt].zarr, where <pair> is the full
+    pairname in rebuilt (_rs) stacks but only <sensor>_<date>_<catid1> in older
+    ones (and some have a doubled 'processed_' prefix). `strip` may be a full
+    pairname, its start, or a STAC item id. Two strips can share sensor, date
+    and first catalogue ID, so an exact pairname match is preferred, and an
+    ambiguous partial name is reported rather than resolved silently.
+    """
+    want = re.sub(r"^SETSM_s2s041_", "", os.path.basename(strip)).split("_2m")[0]
+    hits = {}
+    for entry in os.scandir(zarr_dir):
+        m = re.match(r"^(?:processed_)+(?P<pair>.+?)(?:_dt)?\.zarr$", entry.name)
+        if not m:
+            continue
+        pair = m["pair"]
+        if pair == want or pair.startswith(want + "_") or want.startswith(pair + "_"):
+            hits[pair] = entry.path
+    if not hits:
+        return None
+    if want in hits:
+        return hits[want]
+    if len(hits) > 1:
+        print(f"  ⚠ {strip} matches {len(hits)} zarrs ({', '.join(sorted(hits))}); "
+              f"using {sorted(hits)[0]}. Give the full pairname to choose.")
+    return hits[sorted(hits)[0]]
+
+
 def compute_dem_difference_from_zarr(strip_a, strip_b, zarr_dir):
     """Compute elevation difference from pre-computed zarr files (fast).
     
@@ -469,22 +500,19 @@ def compute_dem_difference_from_zarr(strip_a, strip_b, zarr_dir):
     -------
     diff_masked, valid_mask, metadata or (None, None, None)
     """
-    zarr_dir = Path(zarr_dir)
-    
-    # Find zarr files
-    zarr_path_a = glob.glob(str(zarr_dir / f"processed_{strip_a[:30]}*.zarr"))
-    zarr_path_b = glob.glob(str(zarr_dir / f"processed_{strip_b[:30]}*.zarr"))
-    
-    if not zarr_path_a or not zarr_path_b:
-        if not zarr_path_a:
-            print(f"  Could not find zarr file for {strip_a[:30]}")
-        if not zarr_path_b:
-            print(f"  Could not find zarr file for {strip_b[:30]}")
+    zarr_path_a = _find_strip_zarr(zarr_dir, strip_a)
+    zarr_path_b = _find_strip_zarr(zarr_dir, strip_b)
+
+    if zarr_path_a is None or zarr_path_b is None:
+        if zarr_path_a is None:
+            print(f"  Could not find zarr file for {strip_a}")
+        if zarr_path_b is None:
+            print(f"  Could not find zarr file for {strip_b}")
         return None, None, None
-    
+
     try:
-        store_a = zarr.open(zarr_path_a[0], mode="r")
-        store_b = zarr.open(zarr_path_b[0], mode="r")
+        store_a = zarr.open(zarr_path_a, mode="r")
+        store_b = zarr.open(zarr_path_b, mode="r")
     except Exception as e:
         print(f"  Error opening zarr: {e}")
         return None, None, None
@@ -529,28 +557,27 @@ def compute_dem_difference_from_zarr(strip_a, strip_b, zarr_dir):
 # ============================================================================
 
 def find_coregistered_dem(strip_name, archive_dir, coreg_suffix=None):
-    """Find a coregistered DEM file matching a strip name."""
-    patterns = []
-    
-    if coreg_suffix:
-        patterns.append(os.path.join(archive_dir, f"*{strip_name}*{coreg_suffix}*coregistered.tif"))
-    
-    patterns.append(os.path.join(archive_dir, f"*{strip_name}*coregistered.tif"))
-    patterns.append(os.path.join(archive_dir, f"*{strip_name}*.tif"))
-    
-    for pattern in patterns:
-        matches = glob.glob(pattern)
-        if matches:
-            return matches[0]
-    
-    # Recursive search
-    for pattern in patterns:
-        recursive = os.path.join(archive_dir, "**", os.path.basename(pattern))
-        matches = glob.glob(recursive, recursive=True)
-        if matches:
-            return matches[0]
-    
-    return None
+    """Find the archive file for a strip, by name (no geocell needed).
+
+    Parameters
+    ----------
+    strip_name : str
+        Pairname or its start (e.g. 'WV02_20180326_103001007AC58F00'), or a
+        full STAC item id ('..._2m_lsf_seg1') to pin the segment.
+    archive_dir : str or None
+        Strip archive root; None uses config.ARCHIVE_DIR.
+    coreg_suffix : str, optional
+        Coregistered-file suffix (COREG_SUFFIX in the notebooks, with or
+        without '_coregistered'); it must be one COREG_PARAMS defines. None
+        gives the raw strip, read with its bitmask applied.
+
+    Returns
+    -------
+    str or None
+        Path to the file (open it with elevation_utils.open_dem)
+    """
+    return locate_strip(strip_name, coreg_mode_from_suffix(coreg_suffix),
+                        archive_dir)
 
 
 def compute_dem_difference_from_geotiffs(strip_a, strip_b, archive_dir,
@@ -588,7 +615,7 @@ def compute_dem_difference_from_geotiffs(strip_a, strip_b, archive_dir,
     print(f"  B: {os.path.basename(dem_path_b)[:50]}...")
     
     try:
-        with rio.open(dem_path_a) as src_a, rio.open(dem_path_b) as src_b:
+        with open_dem(dem_path_a) as src_a, open_dem(dem_path_b) as src_b:
             
             # Calculate overlap
             if src_a.crs != src_b.crs:
