@@ -18,11 +18,13 @@ import pystac_client
 import rasterio as rio
 from pyproj import Transformer
 from rasterio import warp
+from rasterio.enums import Resampling
 
 # Import configuration
 from config import (
     STAC_API_URL, COLLECTION_ID, DEFAULT_CRS, GEOGRAPHIC_CRS,
-    DEFAULT_WINDOW_SIZE, DEFAULT_WINDOW_TYPE, MAX_CLOUD_COVER, COREG_PARAMS
+    DEFAULT_WINDOW_SIZE, DEFAULT_WINDOW_TYPE, MAX_CLOUD_COVER, COREG_PARAMS,
+    MOSAIC_DIR, get_mosaic_index_path
 )
 
 
@@ -221,23 +223,173 @@ def find_strip_file(archdir, geocell, strip, coreg_mode='none'):
     return None
 
 
+def coreg_mode_from_suffix(suffix):
+    """Coreg mode ('none' / 'altim' / 'mosaic') for a coregistered-file suffix.
+
+    Accepts the suffix with or without a trailing '_coregistered' (the form the
+    diff notebooks use as COREG_SUFFIX); None means the raw strip ('none').
+    Raises if the suffix isn't one that COREG_PARAMS produces.
+    """
+    if suffix is None:
+        return 'none'
+    clean = suffix[:-len('_coregistered')] if suffix.endswith('_coregistered') else suffix
+    modes = [mode for mode, params in COREG_PARAMS.items() if params]  # not 'none'
+    for mode in modes:
+        if clean == coreg_suffix(mode):
+            return mode
+    valid = {mode: coreg_suffix(mode) for mode in modes}
+    raise ValueError(f"Unknown coregistration suffix {suffix!r}; COREG_PARAMS "
+                     f"defines {valid} (or pass None for the raw strip)")
+
+
+def locate_strip(strip, coreg_mode='none', archdir=None):
+    """Find a strip's file in the archive from its name alone.
+
+    The diff notebooks name strips without their geocell, often only partly
+    (e.g. 'WV02_20180326_103001007AC58F00'). This asks PGC's STAC for the
+    strip on its acquisition date, which gives the full item id and the
+    geocell, then hands over to find_strip_file for the exact file.
+
+    Parameters
+    ----------
+    strip : str
+        A pairname or its start ('<sensor>_<YYYYMMDD>_<catid1>[_<catid2>]'),
+        optionally with 'SETSM_s2s041_' in front, or a full STAC item id
+        ('..._2m_lsf_seg1'), which also pins the segment.
+    coreg_mode : str
+        'none', 'altim' or 'mosaic', as in find_strip_file.
+    archdir : str, optional
+        Strip archive root (contains <geocell>/ directories). Defaults to
+        config.ARCHIVE_DIR; a geocell directory is accepted too.
+
+    Returns
+    -------
+    str or None
+        Path to the file, or None if the strip or its file isn't found
+    """
+    from config import ARCHIVE_DIR
+    archdir = archdir or ARCHIVE_DIR
+    if re.fullmatch(r"[ns]\d{2}[ew]\d{3}", os.path.basename(os.path.normpath(archdir))):
+        archdir = os.path.dirname(os.path.normpath(archdir))
+
+    name = os.path.basename(strip)
+    m = _STRIP_ID_RX.match(name)
+    if m:
+        prefix, seg = m['pair'], m['seg']
+    else:
+        prefix = re.sub(r"^SETSM_s2s041_", "", name).split("_2m")[0]
+        seg = None
+    parts = prefix.split("_")
+    if len(parts) < 2 or not re.fullmatch(r"\d{8}", parts[1]):
+        raise ValueError(f"Can't read an acquisition date from strip name {strip!r}")
+    day = f"{parts[1][:4]}-{parts[1][4:6]}-{parts[1][6:]}"
+
+    items = list(create_stac_client().search(
+        collections=[COLLECTION_ID],
+        datetime=f"{day}T00:00:00Z/{day}T23:59:59Z",
+        filter={"op": "like", "args": [{"property": "pgc:pairname"}, prefix + "%"]},
+        filter_lang="cql2-json",
+    ).items())
+    if seg:
+        items = [it for it in items if it.id.endswith(f"_{seg}")]
+    if not items:
+        print(f"  {strip}: not found in the PGC catalogue")
+        return None
+    items.sort(key=lambda it: it.id)
+    pairs = sorted({it.properties["pgc:pairname"] for it in items})
+    if len(pairs) > 1:
+        print(f"  ⚠ {strip} matches {len(pairs)} strips ({', '.join(pairs)}); "
+              f"using {pairs[0]}. Give the full pairname to choose.")
+        items = [it for it in items if it.properties["pgc:pairname"] == pairs[0]]
+    if len(items) > 1:
+        print(f"  ⚠ {strip}: {len(items)} segments, using {items[0].id} "
+              f"(give the full item id to choose)")
+    item = items[0]
+    return find_strip_file(archdir, item.properties["pgc:geocell"], item.id, coreg_mode)
+
+
+class _BitmaskedDEM:
+    """A strip DEM dataset whose read() blanks the pixels its bitmask flags.
+
+    Every other attribute (transform, nodata, index, window, ...) is the DEM's
+    own. The bitmask is read with the same window / out_shape as the DEM, so
+    it lines up pixel for pixel (same grid, checked in open_dem).
+    """
+
+    def __init__(self, dem, bitmask):
+        self._dem = dem
+        self._bitmask = bitmask
+
+    def __getattr__(self, name):
+        return getattr(self._dem, name)
+
+    def read(self, indexes=None, **kwargs):
+        data = self._dem.read(indexes, **kwargs)
+        mask_kwargs = {k: kwargs[k] for k in ('window', 'boundless') if k in kwargs}
+        if 'out_shape' in kwargs:
+            mask_kwargs['out_shape'] = tuple(kwargs['out_shape'])[-2:]
+            mask_kwargs['resampling'] = Resampling.nearest
+        flagged = self._bitmask.read(1, **mask_kwargs) != 0
+        if np.ma.isMaskedArray(data):
+            data.mask = np.ma.getmaskarray(data) | flagged
+            return data
+        fill = self._dem.nodata if self._dem.nodata is not None else np.nan
+        return np.where(flagged, np.asarray(fill, dtype=data.dtype), data)
+
+
 @contextmanager
 def open_dem(path):
     """Open a DEM for reading, as a context manager yielding a rasterio dataset.
 
-    GeoTIFFs are opened directly. For a strip '.tar.gz' the '_dem.tif' member
-    is streamed into memory; nothing is written to disk.
+    GeoTIFFs are opened directly. For a raw strip, either a '.tar.gz' (its
+    '_dem.tif' and '_bitmask.tif' members streamed into memory; nothing is
+    written to disk) or an unpacked '_dem.tif' with its '_bitmask.tif'
+    alongside, every read() comes back with the pixels the bitmask flags
+    (edge, water, cloud) set to nodata, as in the coregistered GeoTIFFs,
+    where DEMSquad has already blanked them.
     """
     if path.endswith('.tar.gz'):
+        members = {}
         with tarfile.open(path, 'r:gz') as tar:
             for member in tar:
-                if member.name.endswith('_dem.tif'):
-                    data = tar.extractfile(member).read()
+                for suffix in ('_dem.tif', '_bitmask.tif'):
+                    if member.name.endswith(suffix):
+                        members[suffix] = tar.extractfile(member).read()
+                if len(members) == 2:
                     break
-            else:
-                raise ValueError(f"No _dem.tif inside {path}")
-        with rio.MemoryFile(data) as memfile, memfile.open() as src:
-            yield src
+        if '_dem.tif' not in members:
+            raise ValueError(f"No _dem.tif inside {path}")
+        with rio.MemoryFile(members['_dem.tif']) as memfile, memfile.open() as src:
+            if '_bitmask.tif' not in members:
+                print(f"  warning: no _bitmask.tif in {os.path.basename(path)}; "
+                      f"cloud/water pixels are not masked")
+                yield src
+                return
+            with rio.MemoryFile(members['_bitmask.tif']) as maskfile, \
+                    maskfile.open() as mask_src:
+                if mask_src.shape != src.shape or mask_src.transform != src.transform:
+                    print(f"  warning: bitmask grid differs from the DEM in "
+                          f"{os.path.basename(path)}; not masked")
+                    yield src
+                else:
+                    yield _BitmaskedDEM(src, mask_src)
+    elif path.endswith('_dem.tif'):
+        # A raw strip unpacked in the archive: mask it with its sibling bitmask
+        # (coregistered GeoTIFFs end in '_coregistered.tif', not here)
+        bitmask_path = path[:-len('_dem.tif')] + '_bitmask.tif'
+        with rio.open(path) as src:
+            if not os.path.exists(bitmask_path):
+                print(f"  warning: no _bitmask.tif next to {os.path.basename(path)}; "
+                      f"cloud/water pixels are not masked")
+                yield src
+                return
+            with rio.open(bitmask_path) as mask_src:
+                if mask_src.shape != src.shape or mask_src.transform != src.transform:
+                    print(f"  warning: bitmask grid differs from the DEM in "
+                          f"{os.path.basename(path)}; not masked")
+                    yield src
+                else:
+                    yield _BitmaskedDEM(src, mask_src)
     else:
         with rio.open(path) as src:
             yield src
@@ -355,9 +507,7 @@ def transect_from_mosaic(coords_4326, num_samples=100):
     lon_B, lat_B = coords_4326[1]
 
     # Search for the mosaic index
-    mosaicdir = "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/mosaic/"
-    mosaicindexdir = "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/ArcticDEM_Mosaic_Index_latest_shp/"
-    mosaic_index = mosaicindexdir + "ArcticDEM_Mosaic_Index_v4_1_2m.shp"
+    mosaic_index = get_mosaic_index_path()
 
     # Read mosaic_index shapefile
     mosaic_gdf = gpd.read_file(mosaic_index)
@@ -392,7 +542,7 @@ def transect_from_mosaic(coords_4326, num_samples=100):
         tile_id = tile_A + "_2m_v4.1"
 
         # Construct the expected mosaic file path
-        mosaic_dem = f"{mosaicdir}v4.1/2m/{supertile}/{tile_id}_dem.tif"
+        mosaic_dem = f"{MOSAIC_DIR}{supertile}/{tile_id}_dem.tif"
         if not mosaic_dem:
             raise FileNotFoundError(f"No mosaic file found for coordinates {coords_4326}.")
 
@@ -410,14 +560,14 @@ def transect_from_mosaic(coords_4326, num_samples=100):
 
         supertile_A = containing_polygons_A.iloc[0]["supertile"]
         tile_id_A = tile_A + "_2m_v4.1"
-        mosaic_dem_A = f"{mosaicdir}v4.1/2m/{supertile_A}/{tile_id_A}_dem.tif"
+        mosaic_dem_A = f"{MOSAIC_DIR}{supertile_A}/{tile_id_A}_dem.tif"
         if not mosaic_dem_A:
             raise FileNotFoundError(f"No mosaic file found for coordinates {coords_4326}.")
         rasterpath_A = mosaic_dem_A
 
         supertile_B = containing_polygons_B.iloc[0]["supertile"]
         tile_id_B = tile_B + "_2m_v4.1"
-        mosaic_dem_B = f"{mosaicdir}v4.1/2m/{supertile_B}/{tile_id_B}_dem.tif"
+        mosaic_dem_B = f"{MOSAIC_DIR}{supertile_B}/{tile_id_B}_dem.tif"
         if not mosaic_dem_B:
             raise FileNotFoundError(f"No mosaic file found for coordinates {coords_4326}.")
         rasterpath_B = mosaic_dem_B

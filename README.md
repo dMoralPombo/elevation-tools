@@ -1,217 +1,148 @@
-# Elevation from DEMs Tools
+# Elevation from DEMs tools
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Tools for extracting and analyzing elevation profiles and time series from the [ArcticDEM](https://www.pgc.umn.edu/data/arcticdem/) strip dataset. Designed for glaciology >
+Tools for extracting elevation time series, transect profiles and DEM differences from the [ArcticDEM](https://www.pgc.umn.edu/data/arcticdem/) strip DEMs (SETSM s2s041, 2 m). They're built for glaciology in Greenland: lakes, outlet glaciers, surface change. Everything runs from Jupyter notebooks.
 
-## Features
+## What you can do
 
-- **Elevation History**: Extract elevation time series at a point across hundreds of DEMs
-- **Transect Profiles**: Extract and compare elevation profiles along a transect
-- **Differentiation of DEMs**: Computes and visualise elevation differences btween pairs of stripDEMs
-- **Interactive Maps**: Select coordinates using draggable markers on satellite imagery
-- **Window-based Sampling**: Robust elevation extraction using configurable pixel windows
-- **Multiple Coregistration Modes**: Support for raw, altimetry-coregistered, and mosaic-coregistered DEMs
-- **Automatic STAC Queries**: Search the ArcticDEM catalog by location and time range
+- **Elevation history** (`01_history_multimode.ipynb`): the elevation of one or more points through time, from every available strip.
+- **Transect profiles** (`02_transect_multimode.ipynb`): elevation profiles along a line for every strip, overlaid and differenced.
+- **DEM differences** (`04_diffdems.ipynb`, `04_diffstrips.ipynb`, *experimental*): difference maps between two strips.
 
-# Installation
+The tools search the PGC catalogue (STAC API) for every strip over your point or line and time range. They then read the strips from the CPOM archive on luna, either raw or coregistered (see below).
 
-## Clone the repository
+## Quick start (CPOM2)
+
+You need an account on the CPOM2 virtual machine, with the luna share mounted at `~/luna`. The tools search the PGC catalogue online, so the VM also needs internet access.
+
+```bash
+# 1. Get the code
 git clone https://github.com/dMoralPombo/elevation-tools.git
-cd elevation_tools
+cd elevation-tools
 
-## Install dependencies
-pip install -r requirements.txt
+# 2. Create the environment (once)
+conda env create -f environment.yml
+conda activate elevation-tools
+#   or, in an existing environment: pip install -r requirements.txt
 
-# Configuration
+# 3. Check the paths
+python -c "import config"
+```
 
-Before using, edit `config.py` to set your data paths:
+Step 3 prints the paths the tools will use, with a ✓ or a warning for each:
 
-### Edit config.py
-nano config_local.py  # Edit the paths
-ARCHIVE_DIR = "/your/archive/path/"
-MOSAIC_DIR = "/your/mosaic/path/"
+| Path | Default | Override with |
+|---|---|---|
+| luna CPOM folder | `~/luna/CPOM` | `LUNA_ROOT` |
+| Strip archive | `<LUNA_ROOT>/archive/SATS/OPTICAL/ArcticDEM/strips/s2s041/2m/` | `ARCTICDEM_ARCHIVE_DIR` |
+| Mosaic (v4.1, 2 m) | `<LUNA_ROOT>/archive/SATS/OPTICAL/ArcticDEM/mosaic/v4.1/2m/` | `ARCTICDEM_MOSAIC_DIR` |
+| Mosaic index | `<LUNA_ROOT>/archive/SATS/OPTICAL/ArcticDEM/ArcticDEM_Mosaic_Index_latest_shp/` | `ARCTICDEM_MOSAIC_INDEX_DIR` |
+| Your outputs | `<LUNA_ROOT>/<your username>/elevation_tools_outputs/` | `ARCTICDEM_OUTPUT_DIR` |
 
-## Data Requirements
-You need access to:
+If luna is mounted somewhere else, set `LUNA_ROOT` before starting Jupyter. All the defaults follow it:
 
-ArcticDEM Strip Archive: The s2s041/2m/ directory containing SETSM DEM files (.tif or .tar.gz)
+```bash
+export LUNA_ROOT=/path/to/luna/CPOM
+```
 
-Mosaic Index Shapefile (optional): ArcticDEM_Mosaic_Index_v4_1_2m.shp for mosaic tile lookup
+The output folder is created the first time you import the tools.
 
-The tools access the PGC STAC API to discover available DEMs, so an internet connection is required for the catalog search 
-(at least by now until we use a Lancaster/CPOM-based catalogue).
+Then open a notebook in `notebooks/`, in Jupyter or in the VSCode Interactive window, and run the cells in order.
 
-# Usage
+## How the notebooks work
 
-## Jupyter Notebook (Recommended)
-The primary interface is through Jupyter notebooks:
+Every notebook has the same layout:
 
-jupyter notebook
+1. **Setup:** imports the modules from the repository root. Re-running this cell picks up code changes without restarting the kernel.
+2. **Parameters:** everything you normally change is here.
+3. **Select the location**, with one of the input methods:
+   - **Interactive map:** drag the marker(s) and click **Confirm**, then **run the next cell**. The map only passes your choice on after its cell has finished.
+   - **Manual:** type `lon,lat` (or `lon1,lat1,lon2,lat2` for a transect).
+   - **File:** a GeoPackage or GeoParquet with many points or transects, run as a batch.
+   - **Auto-orthogonal** (02 only): two crossing transects centred on a point.
+4. **Run**, then **view the results.**
 
-Then open one of the example notebooks:
+Cells after "View results" (temporal analysis, lake detection, optional batches) are experiments and may change.
 
-✅ Elevation History Analysis (notebooks/01_elevation_history.ipynb)
-This is the stable and fully functional notebook. Use it to:
+### Main parameters
 
-1. Select a point on an interactive satellite map
+| Parameter | Meaning |
+|---|---|
+| `TIME_RANGE` | `"YYYY-MM-DD/YYYY-MM-DD"`. ArcticDEM strips span 2009 to the present. |
+| `COREG_MODE` | `'none'`, `'altim'` or `'mosaic'` (next section). |
+| `WINDOW_SIZE`, `WINDOW_TYPE` (01) | Pixels averaged around each point: `3` = 3×3. `'square'` = full window, `'cross'` = centre row and column. The spread across the window is reported as the uncertainty. |
+| `MAX_DEMS` (02) | Cap on the number of strips; `'none'` mode is slower, so it's capped lower. |
+| `MAX_CLOUD_COVER` | Drop strips whose catalogue cloud fraction (0–1) is above this. |
+| `LAKE_NAME` | Optional label for plot titles. |
 
-2. Search the PGC-API ArcticDEM catalog for all available DEMs at that location
+## Coregistration modes
 
-3. Extract elevations using a configurable window for uncertainties (3x3, 5x5, cross-pattern, etc.)
+Each strip in the archive exists raw, and some also exist coregistered (aligned to a reference surface). `COREG_MODE` chooses which one is read:
 
-4. Plot elevation time series with error bars and trend lines
+| Mode | File read | Notes |
+|---|---|---|
+| `none` | the raw strip `.tar.gz`, read in memory | Every strip is available, but each can be offset by metres. Cloud, water and edge pixels are removed using the strip's bitmask. Slowest mode. |
+| `altim` | the strip coregistered to CryoSat-2 altimetry | Works inland. Over gentle, sparsely sampled ice the horizontal fit can fail, so check large outliers. |
+| `mosaic` | the strip coregistered to the ArcticDEM mosaic | Uses control points on **exposed bedrock** only, so it's reliable near the ice margin and unavailable far inland. |
 
-5. Export data as CSV and figures
+A strip that hasn't been coregistered in the chosen mode is skipped. The exact coregistered files used are set by `COREG_PARAMS` in `config.py`.
 
-## Key parameters:
+## Outputs
 
-WINDOW_SIZE: Number of pixels for elevation averaging (3 = 3x3 window)
+Everything is written under your `OUTPUT_DIR`:
 
-WINDOW_TYPE: 'square' for full window, 'cross' for plus-sign pattern
+```
+elevation_histories/    elevation_history_<lon>_<lat>_<mode>_<years>.png / .txt
+transects/              one profile plot per strip
+transects_combined/     combined profiles (.txt) and plots per transect
+```
 
-COREG_MODE: 'none' (raw DEMs), 'altim' (CryoSat-2 coregistered), 'mosaic' (mosaic-coregistered)
+File names carry the coordinates, the coregistration mode and the years of `TIME_RANGE`. The `.txt` files hold the data behind each plot.
 
-TIME_RANGE: Date range in format "YYYY-MM-DD/YYYY-MM-DD" (total PGC range: 2009-2025)
+## Tips
 
-## Output Structure
+- **Start small:** a short `TIME_RANGE` or a low `MAX_DEMS` first, then widen.
+- **Catalogue search is online.** If PGC's STAC API is slow or down, the search step fails; just re-run it.
+- **Coordinates** are `lon, lat` in WGS84. Everything is processed in EPSG:3413 (NSIDC Polar Stereographic North), so it's Greenland/Arctic only.
+- **Never unpack or edit files in the archive.** The tools read the tarballs in memory.
 
-outputs/
+## Repository layout
 
-├── elevation_histories/
+```
+config.py              paths, catalogue and coregistration settings
+elevation_utils.py     catalogue search, strip lookup and reading, window sampling, transects
+analysis.py            elevation-history and transect workflows, plots
+interactive_maps.py    the ipyleaflet point/transect pickers
+lake_detection.py      experimental lake-boundary detection from transects
+diff_analysis*.py      DEM differencing (zarr-based and GeoTIFF-based)
+notebooks/             the notebooks (old/ holds retired versions)
+```
 
-│   ├── elevation_history_-54.200_75.000_nc_2010-2020.png   # Plot
-
-│   └── elevation_history_-54.200_75.000_nc_2010-2020.txt   # Data
-
-├── transects/
-
-│   └── profile_SETSM_20150701_...png                         # Individual profiles
-
-└── transects_combined/
-
-    ├── combined_profiles_-54.200_75.000_...txt               # Combined data
-    
-    └── profile_-54.200_75.000_...png                         # Combined plot
-
-## Coregistration Modes
-
-Mode	Description	File Pattern	Use Case
-none	Raw compressed DEMs	*_dem.tif.gz or *.tar.gz	Original SETSM elevations
-altim	CryoSat-2 coregistered	*cs2*coregistered.tif	Corrected to altimetry
-mosaic	Mosaic-coregistered	*mosaic*coregistered.tif	Corrected to ArcticDEM mosaic
-
-Coregistration parameters are configured in config.py under COREG_PARAMS.
-
-## Window Types
-
-The elevation extraction uses a window of pixels around the target coordinates:
-
--Square (window_type='square'): Full N×N window averaging
-
--Cross (window_type='cross'): Plus-sign pattern (center row + center column)
-
-Window size examples:
-
--window_size=1: Single pixel (no averaging)
-
--window_size=3: 3×3 window (9 pixels) or cross of 5 pixels
-
--window_size=5: 5×5 window (25 pixels) or cross of 9 pixels
-
-Larger windows provide more robust elevation estimates with uncertainty (standard deviation).
-
-#### ✅ DEM Difference Analysis (`notebooks/03_dem_difference.ipynb`)
-
-**Status: Not Functional (yet)**
-
-This notebook computes and visualizes elevation differences between pairs of ArcticDEM strips using pre-computed zarr files. Use it to:
-
-1. **Select strip pairs** for comparison
-2. **Compute elevation differences** (newer − older)
-3. **Generate publication-quality difference maps** with:
-   - Dual EPSG:3413 / EPSG:4326 coordinate axes
-   - Statistics box (valid pixels, mean, std, min, max)
-   - Optional shapefile overlay (e.g., lake boundaries)
-   - Automatic cropping to valid data region
-   - Intelligent downsampling for large arrays
-
-**Key parameters:**
-- `TILE`: Tile identifier (e.g., `"31_38_1_1"`)
-- `STRIP_PAIRS`: List of (newer_strip, older_strip) tuples
-- `EXTENT`: Tile bounds in EPSG:3413 meters `(left, bottom, right, top)`
-- `SHP_PATH`: Optional path to shapefile for overlay
-
-**Requirements:**
-- Pre-computed zarr files from the GLOBE processing pipeline
-- Shapefile for overlay (optional)
-
-**Example workflow:**
-```python
-from diff_analysis import run_dem_difference
-
-results = run_dem_difference(
-    tile="31_38_1_1",
-    strip_pairs=[
-        ("strip_2024", "strip_2022"),
-        ("strip_2023", "strip_2021"),
-    ],
-    zarr_dir="/path/to/zarr/files/",
-    extent=(-300000, -1000000, -250000, -950000),
-    shp_path="/path/to/lakes.shp",
-)
+Lake volume work is in progress on the `volume_beta` branch.
 
 ## Limitations
 
--Coordinate System: Currently hardcoded for Greenland (EPSG:3413). For other Arctic regions, modify the CRS in config.py.
+- Greenland/Arctic only (EPSG:3413), and only the `arcticdem-strips-s2s041-2m` collection.
+- The paths assume the CPOM luna layout. Elsewhere, set the environment variables above.
+- Reading many strips is slow and memory-hungry; `'none'` mode most of all.
 
--DEM Source: Only supports the arcticdem-strips-s2s041-2m collection from PGC.
+## Citation
 
--File Format: Assumes SETSM v4.1 naming conventions (SETSM_s2s041_<pairname>_2m_lsf_seg1_dem.tif).
+If you use these tools, please cite the data:
 
--Internet Required: STAC catalog queries need internet access.
+- Porter, C., et al. (2023). ArcticDEM – Strips, Version 4.1. Harvard Dataverse. https://doi.org/10.7910/DVN/OHHUKH
 
--Memory: Reading multiple DEMs can be memory-intensive for large transects.
+## Contact
 
-# Contributing
+Diego Moral Pombo, Lancaster University: d.moralpombo@lancaster.ac.uk (GitHub: @dMoralPombo)
 
-This tool is under active development. If you encounter issues or have suggestions:
+## Acknowledgements
 
-1. Check the GitHub Issues
+- ArcticDEM data provided by the Polar Geospatial Center (PGC); catalogue via https://stac.pgc.umn.edu/
+- Coregistered strips from the DEMSquad / GLOBE processing pipeline (thanks, DEMSquad!)
 
-2. Create a new issue with:
+## License
 
--Description of the problem
-
--Steps to reproduce
-
--Your environment (Python version, operating system)
-
--Any error messages
-
-# License
-
-MIT License - see LICENSE file for details.
-
-# Citation
-
-If you use this tool in your research, please cite:
-
--Porter, C., et al. (2023). ArcticDEM. Harvard Dataverse. https://doi.org/10.7910/DVN/OHHUKH
-
-# Contact
-
--Author: Diego Moral Pombo
-
--Email: d.moralpombo@lancaster.ac.uk
-
--GitHub: @dMoralPombo
-
-# Acknowledgments
-
--ArcticDEM data provided by the Polar Geospatial Center (PGC)
-
--STAC API access via https://stac.pgc.umn.edu/
-
--Built with inspiration from the GLOBE processing pipeline (thanks DEMSquad!)
+MIT
