@@ -1,14 +1,27 @@
+# Core: elevation histories (01), transects (02), DEM differences (04)
 numpy>=1.20.0
 pandas>=1.3.0
 polars>=0.18.0
 geopandas>=0.10.0
+shapely>=1.8.0
+pyproj>=3.0.0
 rasterio>=1.2.0
+fiona>=1.8.0
+zarr>=2.13,<3          # 04_diffdems reads zarr v2 stores
 matplotlib>=3.5.0
 scipy>=1.7.0
 pystac-client>=0.5.0
-pyproj>=3.0.0
 tqdm>=4.60.0
+geopy>=2.2.0
+
+# Notebooks and the interactive maps
+ipykernel>=6.0
 ipyleaflet>=0.17.0
 ipywidgets>=7.6.0
-shapely>=1.8.0
-geopy>=2.2.0
+
+# Optional: the lake volume scripts (notebooks/volume*.py)
+# xarray>=2023.1
+# rioxarray>=0.13
+# netCDF4>=1.6
+# ruptures>=1.1
+# duckdb>=0.9

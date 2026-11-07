@@ -725,14 +725,17 @@ def plot_elevation_history(history, output_path=None, coreg_mode='none', lake_na
     #     'elevation_histories',
     #     f"elevation_history_{coords[0]:.3f}_{coords[1]:.3f}_{coreg_mode}_{years}.png"
     # )
+    # Default: next to the data file, in OUTPUT_DIR/elevation_histories
+    out_dir = output_path if output_path else os.path.join(OUTPUT_DIR, 'elevation_histories')
+    os.makedirs(out_dir, exist_ok=True)
     if lake_name is None:
         output_path = os.path.join(
-            output_path if output_path else OUTPUT_DIR,
+            out_dir,
             f"elevation_history_{coords[0]:.3f}_{coords[1]:.3f}_{coreg_mode}_{years}.png"
         )
     else:
         output_path = os.path.join(
-            output_path if output_path else OUTPUT_DIR,
+            out_dir,
             f"elevation_history_{lake_name}_{coords[0]:.3f}_{coords[1]:.3f}_{coreg_mode}_{years}.png"
         )
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -1948,7 +1951,7 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
         print(f"Plot saved to: {output_name}")
     
     plt.show()
-    return fig
+    return output_name if output_path else fig
 
 # ============================================================================
 # MAIN WORKFLOW FUNCTIONS

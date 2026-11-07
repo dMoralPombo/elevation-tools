@@ -1,39 +1,59 @@
 """
 Configuration for Elevation From DEMs
 ==================================
-Edit the paths below to match your system setup.
+Paths are built from the luna share mounted at ~/luna (LUNA_ROOT) and your
+username, so the same file works for anyone on CPOM2. To change a path
+without editing this file, set its environment variable before starting
+Jupyter, e.g.
+
+    export LUNA_ROOT=/mnt/luna/CPOM                      # luna mounted elsewhere
+    export ARCTICDEM_OUTPUT_DIR=~/luna/CPOM/$USER/my_outputs
+
+Each variable overrides one path; LUNA_ROOT moves all the defaults at once.
 """
 
+import getpass
 import os
 from pathlib import Path
 
 # ============================================================================
-# PATH CONFIGURATION - EDIT THESE PATHS
+# PATH CONFIGURATION
 # ============================================================================
 
-# Main archive directory for ArcticDEM strip files
-ARCHIVE_DIR = os.getenv(
-    'ARCTICDEM_ARCHIVE_DIR',
-    "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/strips/s2s041/2m/"
-)
+USERNAME = getpass.getuser()
 
-# Mosaic directory
-MOSAIC_DIR = os.getenv(
+# The CPOM folder of the luna share (contains archive/ and one folder per user)
+LUNA_ROOT = os.path.expanduser(os.getenv('LUNA_ROOT', '~/luna/CPOM'))
+
+ARCTICDEM_ROOT = os.path.join(LUNA_ROOT, 'archive', 'SATS', 'OPTICAL', 'ArcticDEM')
+
+# Main archive directory for ArcticDEM strip files
+ARCHIVE_DIR = os.path.expanduser(os.getenv(
+    'ARCTICDEM_ARCHIVE_DIR',
+    os.path.join(ARCTICDEM_ROOT, 'strips', 's2s041', '2m', '')
+))
+
+# Mosaic directory (v4.1, 2 m), containing one folder per supertile
+MOSAIC_DIR = os.path.expanduser(os.getenv(
     'ARCTICDEM_MOSAIC_DIR',
-    "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/mosaic/v4.1/2m/"
-)
+    os.path.join(ARCTICDEM_ROOT, 'mosaic', 'v4.1', '2m', '')
+))
 
 # Mosaic index shapefile directory
-MOSAIC_INDEX_DIR = os.getenv(
+MOSAIC_INDEX_DIR = os.path.expanduser(os.getenv(
     'ARCTICDEM_MOSAIC_INDEX_DIR',
-    "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/ArcticDEM_Mosaic_Index_latest_shp/"
-)
+    os.path.join(ARCTICDEM_ROOT, 'ArcticDEM_Mosaic_Index_latest_shp', '')
+))
 
-# Output directory for results
-OUTPUT_DIR = os.getenv(
+# Output directory for results: your own folder on luna. An existing
+# globe/data/ArcticDEM/ folder there is kept as the output folder (the layout
+# this project has always used); otherwise outputs go to elevation_tools_outputs/.
+_legacy_output = os.path.join(LUNA_ROOT, USERNAME, 'globe', 'data', 'ArcticDEM', '')
+OUTPUT_DIR = os.path.expanduser(os.getenv(
     'ARCTICDEM_OUTPUT_DIR',
-    "/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/"
-)
+    _legacy_output if os.path.isdir(_legacy_output)
+    else os.path.join(LUNA_ROOT, USERNAME, 'elevation_tools_outputs', '')
+))
 
 # ============================================================================
 # API CONFIGURATION

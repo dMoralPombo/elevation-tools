@@ -1,0 +1,29 @@
+# conda env create -f environment.yml && conda activate elevation-tools
+name: elevation-tools
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - polars
+  - geopandas
+  - shapely
+  - pyproj
+  - rasterio
+  - fiona
+  - zarr<3
+  - matplotlib
+  - scipy
+  - pystac-client
+  - tqdm
+  - geopy
+  - ipykernel
+  - ipyleaflet
+  - ipywidgets
+  # optional, for the lake volume scripts
+  - xarray
+  - rioxarray
+  - netcdf4
+  - ruptures
+  - python-duckdb

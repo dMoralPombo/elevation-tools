@@ -23,7 +23,8 @@ from rasterio.enums import Resampling
 # Import configuration
 from config import (
     STAC_API_URL, COLLECTION_ID, DEFAULT_CRS, GEOGRAPHIC_CRS,
-    DEFAULT_WINDOW_SIZE, DEFAULT_WINDOW_TYPE, MAX_CLOUD_COVER, COREG_PARAMS
+    DEFAULT_WINDOW_SIZE, DEFAULT_WINDOW_TYPE, MAX_CLOUD_COVER, COREG_PARAMS,
+    MOSAIC_DIR, get_mosaic_index_path
 )
 
 
@@ -506,9 +507,7 @@ def transect_from_mosaic(coords_4326, num_samples=100):
     lon_B, lat_B = coords_4326[1]
 
     # Search for the mosaic index
-    mosaicdir = "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/mosaic/"
-    mosaicindexdir = "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/ArcticDEM_Mosaic_Index_latest_shp/"
-    mosaic_index = mosaicindexdir + "ArcticDEM_Mosaic_Index_v4_1_2m.shp"
+    mosaic_index = get_mosaic_index_path()
 
     # Read mosaic_index shapefile
     mosaic_gdf = gpd.read_file(mosaic_index)
@@ -543,7 +542,7 @@ def transect_from_mosaic(coords_4326, num_samples=100):
         tile_id = tile_A + "_2m_v4.1"
 
         # Construct the expected mosaic file path
-        mosaic_dem = f"{mosaicdir}v4.1/2m/{supertile}/{tile_id}_dem.tif"
+        mosaic_dem = f"{MOSAIC_DIR}{supertile}/{tile_id}_dem.tif"
         if not mosaic_dem:
             raise FileNotFoundError(f"No mosaic file found for coordinates {coords_4326}.")
 
@@ -561,14 +560,14 @@ def transect_from_mosaic(coords_4326, num_samples=100):
 
         supertile_A = containing_polygons_A.iloc[0]["supertile"]
         tile_id_A = tile_A + "_2m_v4.1"
-        mosaic_dem_A = f"{mosaicdir}v4.1/2m/{supertile_A}/{tile_id_A}_dem.tif"
+        mosaic_dem_A = f"{MOSAIC_DIR}{supertile_A}/{tile_id_A}_dem.tif"
         if not mosaic_dem_A:
             raise FileNotFoundError(f"No mosaic file found for coordinates {coords_4326}.")
         rasterpath_A = mosaic_dem_A
 
         supertile_B = containing_polygons_B.iloc[0]["supertile"]
         tile_id_B = tile_B + "_2m_v4.1"
-        mosaic_dem_B = f"{mosaicdir}v4.1/2m/{supertile_B}/{tile_id_B}_dem.tif"
+        mosaic_dem_B = f"{MOSAIC_DIR}{supertile_B}/{tile_id_B}_dem.tif"
         if not mosaic_dem_B:
             raise FileNotFoundError(f"No mosaic file found for coordinates {coords_4326}.")
         rasterpath_B = mosaic_dem_B

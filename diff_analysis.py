@@ -31,7 +31,7 @@ from matplotlib.collections import PatchCollection
 from matplotlib.path import Path as MplPath
 
 # Import shared utilities
-from config import OUTPUT_DIR, get_output_path
+from config import OUTPUT_DIR, MOSAIC_DIR, get_output_path
 from elevation_utils import locate_strip, coreg_mode_from_suffix, open_dem
 
 # ============================================================================
@@ -1873,12 +1873,11 @@ def get_tile_bounds(TILE):
     """Get EPSG:3413 bounds for a given tile identifier."""
 
     # Try to load mosaic DEM
-    mosaicdir = '/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/mosaic/'
     try:
         tile_parts = TILE.split("_")
         supertile = f"{tile_parts[0]}_{tile_parts[1]}"
         mosaic_path = os.path.join(
-            mosaicdir, f"v4.1/2m/{supertile}/{TILE}_2m_v4.1_dem.tif"
+            MOSAIC_DIR, supertile, f"{TILE}_2m_v4.1_dem.tif"
         )
 
         if os.path.exists(mosaic_path):
@@ -1923,9 +1922,7 @@ def quick_plot_zarr(zarr_dir, tile, strip_pairs, max_files=4, downsample_to=500)
     
     # Try to also load the mosaic tile for comparison
     mosaic_path = None
-    mosaic_dirs = [
-        f"/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/mosaic/v4.1/2m/",
-    ]
+    mosaic_dirs = [MOSAIC_DIR]
     for md in mosaic_dirs:
         # Look for the tile in mosaic
         pattern = os.path.join(md, f"*{tile[:5]}*", f"*{tile}*_dem.tif")
