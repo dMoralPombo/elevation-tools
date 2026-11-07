@@ -9,6 +9,7 @@ Tools for extracting elevation time series, transect profiles and DEM difference
 
 - **Elevation history** (`01_history_multimode.ipynb`): the elevation of one or more points through time, from every available strip.
 - **Transect profiles** (`02_transect_multimode.ipynb`): elevation profiles along a line for every strip, overlaid and differenced.
+- **Lake elevation and volume change** (`03_volume.ipynb`, *work in progress*): for a lake polygon, the lake surface relative to its surroundings through time, ice thickness and d/H, and the drain/fill events with their volumes. It reads the per-tile zarr stacks made by the GLOBE pipeline.
 - **DEM differences** (`04_diffdems.ipynb`, `04_diffstrips.ipynb`, *experimental*): difference maps between two strips.
 
 The tools search the PGC catalogue (STAC API) for every strip over your point or line and time range. They then read the strips from the CPOM archive on luna, either raw or coregistered (see below).
@@ -50,6 +51,16 @@ export LUNA_ROOT=/path/to/luna/CPOM
 The output folder is created the first time you import the tools.
 
 Then open a notebook in `notebooks/`, in Jupyter or in the VSCode Interactive window, and run the cells in order.
+
+### Lake volume notebook (03)
+
+`03_volume.ipynb` works on one lake at a time, from a polygon file (one polygon per lake). Its default file holds the current candidate lakes. The steps:
+1. **Stack:** it lists the tile's zarr stacks and picks one. Rebuilt stacks (`_rs` in the folder name) come first; set `REFERENCE` to `'cs2'` or `'mosaic'` when a tile has both.
+2. **Time series:** lake-mean elevation minus a background ring, for every strip.
+3. **Ice thickness:** BedMachine thickness and the lake's d/H.
+4. **Outline and events** (optional, a few minutes): an SD-based outline, and the drain/fill events between observations with their volumes.
+
+Outputs go to `OUTPUT_DIR/volume/notebook_<lake>_<date>/`. Results from stacks not yet rebuilt (no `_rs` in the name) are provisional.
 
 ## How the notebooks work
 
@@ -115,12 +126,12 @@ config.py              paths, catalogue and coregistration settings
 elevation_utils.py     catalogue search, strip lookup and reading, window sampling, transects
 analysis.py            elevation-history and transect workflows, plots
 interactive_maps.py    the ipyleaflet point/transect pickers
+lake_volume.py         lake time series, outlines, epoch differences and volumes from the zarr stacks
 lake_detection.py      experimental lake-boundary detection from transects
 diff_analysis*.py      DEM differencing (zarr-based and GeoTIFF-based)
-notebooks/             the notebooks (old/ holds retired versions)
+notebooks/             the notebooks (old/ holds retired versions);
+                       03_volume_batch.py runs the volume steps for every lake
 ```
-
-Lake volume work is in progress on the `volume_beta` branch.
 
 ## Limitations
 

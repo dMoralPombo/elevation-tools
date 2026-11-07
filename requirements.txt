@@ -19,9 +19,9 @@ ipykernel>=6.0
 ipyleaflet>=0.17.0
 ipywidgets>=7.6.0
 
-# Optional: the lake volume scripts (notebooks/volume*.py)
-# xarray>=2023.1
-# rioxarray>=0.13
-# netCDF4>=1.6
-# ruptures>=1.1
-# duckdb>=0.9
+# Lake volume (03_volume)
+xarray>=2023.1
+rioxarray>=0.13
+netCDF4>=1.6
+ruptures>=1.1
+duckdb>=0.9

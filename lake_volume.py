@@ -1,13 +1,23 @@
 """
-Stage 1: coarse event detection from existing 5x5-cluster elevation-history files.
-Stage 2: refined volume from full-resolution zarr rasters, cropped to lake polygons,
-         restricted to the event window found in Stage 1.
+lake_volume: lake elevation and volume change from the per-tile zarr stacks.
+
+Reads the stacks GLOBE writes to <ArcticDEM archive>/tile_zarrs/<tile>/<variant>/
+(one zarr per strip, 25000 x 25000 px at 2 m, EPSG:3413) and, for a lake polygon:
+  - picks the stack to use (select_preferred_subfolder) and indexes its strips;
+  - builds the lake-minus-background time series (build_buffer_corrected_timeseries);
+  - maps per-pixel change and outlines (build_persistence_mask, sd_outline);
+  - differences observation epochs into drain/fill outlines and volumes
+    (build_epoch_differences, contour_volumes);
+  - adds ice thickness and d/H from BedMachine (lake_ice_thickness, add_d_over_h).
+
+Used by notebooks/03_volume.ipynb (one lake, step by step) and
+notebooks/03_volume_batch.py (all lakes, as a long background run).
+The older "Stage 1" helpers (parse_elevation_history, detect_event_window, ...)
+work on the elevation-history .txt files from 01_history_multimode.
 """
-# %%
 
 import os
 import re
-import sys
 from functools import lru_cache
 import numpy as np
 import pandas as pd
@@ -22,10 +32,7 @@ import rasterio.features
 import rasterio.transform
 from shapely.geometry import shape
 
-# Repo root on the path (same convention as the 01_/02_ notebooks), for config
-sys.path.append(os.path.abspath(".."))
-sys.path.append(os.path.abspath("."))
-from config import OUTPUT_DIR, ARCHIVE_DIR
+from config import OUTPUT_DIR, ARCHIVE_DIR, LUNA_ROOT, ARCTICDEM_ROOT, get_mosaic_index_path
 
 # All plots from this workflow go here (was: the current working directory)
 VOLUME_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "volume")
@@ -157,13 +164,18 @@ def robust_event_bounds(df, window, elev_col="Elevation (m)", low_pct=5, high_pc
 #   processed_<platform>_<YYYYMMDD>_<catalogID>_dt.zarr
 STRIP_DATE_PATTERN = re.compile(r"processed_[A-Za-z0-9]+_(\d{8})_")
 
-TILE_ZARR_BASE = "/home/moralpom/luna/CPOM/archive/SATS/OPTICAL/ArcticDEM/tile_zarrs"
+TILE_ZARR_BASE = os.path.join(ARCTICDEM_ROOT, "tile_zarrs")
 MEGATILE_SUBDIR = "megatile"  # tile_zarrs/megatile/<tile_id>_<cs2|mosaic>, kept with outliers
 # Stacks rebuilt after the October 2026 GLOBE fixes carry "_rs" (resampled
 # placement), e.g. cs2_..._deramp_rs_std30_mean20_outliersout_50m
 _RS_TAG_RX = re.compile(r"_rs(_|$)")
+# Stack variants used only when nothing else exists: dh/dt-grid detrending
+# ("_dtg3p5km") and per-segment stacks ("_seg")
+_SPECIAL_VARIANT_RX = re.compile(r"_dtg|_seg(_|$)")
 # GLOBE's stacking logbook: one row per FINISHED stack (store_dir = its folder)
-STACK_LOGBOOK = "/home/moralpom/luna/CPOM/moralpom/globe/data/stacking_tracking.duckdb"
+STACK_LOGBOOK = os.getenv(
+    "GLOBE_STACK_LOGBOOK",
+    os.path.join(LUNA_ROOT, "moralpom", "globe", "data", "stacking_tracking.duckdb"))
 
 
 def _finished_stack_dirs():
@@ -240,7 +252,7 @@ def list_tile_zarr_subfolders(tile_id, base_dir=TILE_ZARR_BASE):
     return sorted(names)
 
 
-def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE):
+def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE, reference=None):
     """
     Applies your stated preferences to the raw subfolder list:
     0. "nocoreg" (no coregistration) is dropped whenever a cs2/mosaic
@@ -251,6 +263,13 @@ def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE):
        pipeline (cs2 or mosaic) -- collapsed automatically, no ambiguity.
        Rebuilt "_rs" stacks come before older ones whatever their outlier
        setting, since the older stacks predate the GLOBE stacking fixes.
+       Among rebuilt stacks, the Nuth & Kaab fallback ("_nkfb20m": strips
+       shifted > 20 m redone without Nuth & Kaab) comes first. Stacks
+       detrended with the smoothed dh/dt grid ("_dtg...") and per-segment
+       stacks ("_seg") are only used when nothing else exists: the grid
+       may absorb part of a lake's signal, and segments of one strip pair
+       aren't merged before the lake-coverage filter yet. Pass `subfolder`
+       explicitly to use one of them anyway.
        Then the tile's own folders, and the megatile copy (which keeps
        outliers) only when the tile folder has no stack of that reference.
     2. cs2 (CryoSat-2-referenced) vs mosaic (ArcticDEM-mosaic-referenced)
@@ -260,6 +279,9 @@ def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE):
        further inland). That's geographic judgement this function doesn't
        have, so if both remain after step 1, it still raises rather than
        guessing -- you decide per tile based on that heuristic.
+
+    reference: 'cs2' or 'mosaic' to make the step-2 choice here (only
+    stacks with that reference are considered).
 
     Returns the single resolved subfolder name if unambiguous; raises
     listing the remaining choice(s) otherwise.
@@ -281,6 +303,12 @@ def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE):
     for name in available:
         by_reference.setdefault(reference_type(name), []).append(name)
 
+    if reference is not None:
+        if reference not in by_reference:
+            raise ValueError(f"tile {tile_id} has no {reference} stack; available: "
+                             f"{available}")
+        by_reference = {reference: by_reference[reference]}
+
     # Uncoregistered data is only a last resort: drop it whenever a
     # coregistered (cs2/mosaic) alternative exists
     if "nocoreg" in by_reference and ({"cs2", "mosaic"} & set(by_reference)):
@@ -288,7 +316,9 @@ def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE):
 
     collapsed = []
     for ref, names in by_reference.items():
-        names = sorted(names, key=lambda n: (not _RS_TAG_RX.search(n),
+        names = sorted(names, key=lambda n: (bool(_SPECIAL_VARIANT_RX.search(n)),
+                                             not _RS_TAG_RX.search(n),
+                                             "_nkfb" not in n,
                                              "outliersout" not in n,
                                              n.startswith(f"{MEGATILE_SUBDIR}/")))
         collapsed.append(names[0])
@@ -305,6 +335,9 @@ def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE):
         if not _RS_TAG_RX.search(chosen) and "nocoreg" not in chosen:
             print(f"note: tile {tile_id} has no rebuilt (_rs) stack yet; "
                   f"using the older {chosen}")
+        if _SPECIAL_VARIANT_RX.search(chosen):
+            print(f"note: tile {tile_id} only has a dh/dt-grid or per-segment "
+                  f"stack ({chosen}); see select_preferred_subfolder")
         if chosen.startswith(f"{MEGATILE_SUBDIR}/"):
             print(f"note: tile {tile_id} uses the megatile stack {chosen}, "
                   f"which keeps outliers (no outliersout stack exists)")
@@ -337,7 +370,7 @@ def get_tile_zarr_dir(tile_id, subfolder, base_dir=TILE_ZARR_BASE):
     return path
 
 
-def build_strip_index(tile_id, subfolder=None):
+def build_strip_index(tile_id, subfolder=None, reference=None):
     """
     Scans a tile's zarr directory and returns {pd.Timestamp: [zarr_paths]}.
     Uses site->tile_id mapping you already maintain elsewhere -- pass the
@@ -353,7 +386,7 @@ def build_strip_index(tile_id, subfolder=None):
     which this function doesn't know).
     """
     if subfolder is None:
-        subfolder = select_preferred_subfolder(tile_id)
+        subfolder = select_preferred_subfolder(tile_id, reference=reference)
         print(f"using subfolder: {subfolder}")
 
     tile_dir = get_tile_zarr_dir(tile_id, subfolder)
@@ -440,10 +473,7 @@ def get_site_lonlat_from_polygon(lake_gdf, tile_crs=None):
 # before trusting this on lakes you haven't already checked by eye.
 # ---------------------------------------------------------------------------
 
-TILE_INDEX_PATH = (
-    "/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/mosaic/"
-    "ArcticDEM_Mosaic_Index_latest_shp/ArcticDEM_Mosaic_Index_v4_1_2m.shp"
-)
+TILE_INDEX_PATH = get_mosaic_index_path()
 TILE_CRS = "EPSG:3413"
 TILE_RESOLUTION = 2.0
 TILE_SHAPE = (25000, 25000)  # (rows, cols) -- confirmed from zarr diagnostic
@@ -2485,8 +2515,8 @@ def plot_contour_comparison(ts_by_contour, vol_by_contour, lake_name=None, outpu
 # has a "thickness" variable) or a single-band thickness GeoTIFF. NOT the
 # bed GeoTIFF: bed is geoid-referenced, ArcticDEM is ellipsoidal, and the
 # difference (tens of metres) would swamp a 10 m thickness estimate.
-BEDMACHINE_PATH = ("/home/moralpom/luna/CPOM/archive/RESOURCES/surface_discrimination_masks/"
-                   "greenland/bedmachine_v6/BedMachineGreenland-v6.nc")
+BEDMACHINE_PATH = os.path.join(LUNA_ROOT, "archive", "RESOURCES", "surface_discrimination_masks",
+                               "greenland", "bedmachine_v6", "BedMachineGreenland-v6.nc")
 
 
 def lake_ice_thickness(lake_gdf, bedmachine_path=None):
@@ -2857,287 +2887,3 @@ def plot_polygon_timeseries(ts_df, window=None, output_path=None, lake_name=None
     plt.close(fig)
     print(f"Plot saved: {output_path}")
     return output_path
-
-
-#%% 
-# ===========================================================================
-# Example end-to-end usage
-# ===========================================================================
-if __name__ == "__main__":
-    # polygon_path = "/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/candidates_polygons_august26.gpkg"
-    # polygon_path = "/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/candidates_polygons_01sept26.gpkg"
-    polygon_path = "/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/candidates_polygons_02sept26.gpkg"
-    index_path = "/home/moralpom/luna/CPOM/moralpom/globe/data/ArcticDEM/mosaic/ArcticDEM_Mosaic_Index_latest_shp/ArcticDEM_Mosaic_Index_v4_1_2m.shp"
-    gdf = gpd.read_file(index_path)
-    lake_list_gdf = gpd.read_file(polygon_path)
-    selection = lake_list_gdf[lake_list_gdf.index.isin([1, 9, 10, 11, 13, 19, 20, 21, 23, 24, 26, 27, 28, 29, 30, 31])]
-    lake_names = ['Flade Isblink', 'Sermeq SW', 'Sermeq Centre', 'Sermeq NE', 'Inuppaat Quuaat 01 (Edge)', 'Upernavik W',\
-                'Upernavik E', 'Usulluup Sermia (Big)', 'Inuppaat Quuaat 02 (Usu)', 'Candidate #5', 'Candidate #8',\
-                'Candidate #7', 'Candidate #6', 'Sermeq (Jade)', 'Candidate #9', 'Candidate #4' ]
-    selection['lake_name'] = lake_names
-    print("CRS:", gdf.crs)
-    print("columns:", list(gdf.columns))
-    print()
-    print(gdf.head(3))
-    print()
-
-    import gc
-    SUPERLAKE_MIN_FRAC = 0.10  # min outline piece = 10% of the manual polygon area
-    RING_GAP_FRAC = 0.5        # background ring starts 0.5 r outside the manual polygon
-    RING_WIDTH_FRAC = 1.0      # ... and is 1 r wide (r = equivalent-circle radius)
-    SD_MIN_THRESHOLD_M = None  # floor for the SD-outline threshold (m); None = ring-based only
-    EPOCH_DAYS = 30            # strips within 30 days of an epoch's first strip form one epoch
-    EPOCH_MIN_ABS_DZ_M = None  # floor for the epoch-difference threshold (m)
-    SD_FIXED_THRESHOLDS_M = (2.0, 3.0, 5.0)  # extra SD contours compared per lake
-    # Each run writes to its own folder: files from earlier runs that are
-    # open elsewhere (Windows locks them) are never touched
-    from datetime import datetime
-    run_dir = os.path.join(VOLUME_OUTPUT_DIR, f"persistence_{datetime.now():%Y%m%d_%H%M}")
-    os.makedirs(run_dir, exist_ok=True)
-    print(f"output folder: {run_dir}")
-    gpkg_path = os.path.join(run_dir, "persistence_outlines.gpkg")
-    qc_path = os.path.join(run_dir, "persistence_qc.csv")
-    for old in (gpkg_path, os.path.join(run_dir, "coverage_strips.csv"),
-                os.path.join(run_dir, "coverage_gaps.csv"),
-                os.path.join(run_dir, "epochs.csv"), os.path.join(run_dir, "epoch_intervals.csv"),
-                os.path.join(run_dir, "contour_volumes.csv"),
-                os.path.join(run_dir, "contour_timeseries.csv")):
-        if os.path.exists(old):
-            os.remove(old)  # regenerated from scratch each run
-    qc_rows = []
-
-    # Process lakes in order of strips in their tile (fewest first), so
-    # finished lakes appear early and the slowest ones (e.g. Flade) come last
-    def _n_strips(subtile):
-        try:
-            import contextlib, io
-            with contextlib.redirect_stdout(io.StringIO()):
-                return sum(map(len, build_strip_index(subtile[:9]).values()))
-        except Exception:
-            return 0  # fails fast anyway (recorded as skipped)
-    selection = selection.assign(_n_strips=selection["subtile"].map(_n_strips))
-    selection = selection.sort_values("_n_strips", kind="stable")
-    # Optional subset: VOLUME_LAKES="Candidate #8;Flade Isblink" runs only those
-    only = [n.strip() for n in os.environ.get("VOLUME_LAKES", "").split(";") if n.strip()]
-    if only:
-        selection = selection[selection["lake_name"].isin(only)]
-    print("processing order:", list(zip(selection["lake_name"], selection["_n_strips"])))
-    for a in range(len(selection))[:]:
-        lake_list_name = selection.iloc[a]["lake_name"]
-        try:
-            lake_gdf = selection.iloc[[a]]
-            lakename = lake_gdf.lake_name.values[0]
-            subtile = lake_gdf["subtile"].iloc[0]  # pull out the scalar string
-            # Try to find the row matching your tile_id, checking likely column names
-            tile_id = subtile[:9]  # Adjust the slicing based on your actual tile_id format
-            site_id = tile_id
-
-            # lake_gdf = lake_list_gdf[lake_list_gdf['subtile'] == tile_id]
-            # lake_gdf = lake_list_gdf[lake_list_gdf.index == 13]
-            lake_gdf = lake_gdf.to_crs("EPSG:3413")  # ensure same CRS for cropping
-            lon, lat = get_site_lonlat_from_polygon(lake_gdf)
-            try:
-                strip_index = build_strip_index(tile_id)
-                # print(f'strip index OK for {subtile}')
-            except Exception as e:
-                # strip_index = build_strip_index(tile_id, subfolder="mosaic_v_0_dh_0_vertical_offset_mean_nuthkaab_deramp_*50m")
-                print(f'No strip index for {subtile}: {e}')
-                qc_rows.append({"lake_name": lake_list_name, "status": "skipped",
-                                "reason": f'no strip index: {e}'})
-                pd.DataFrame(qc_rows).to_csv(qc_path, index=False)
-                continue
-
-            # Buffer-corrected mega-timeseries (replaces the distant-control-site
-            # noise floor for confirmed/delineated lakes -- see build_buffer_corrected_
-            # timeseries docstring). Same streaming approach, same memory profile.
-            # ts_df = build_buffer_corrected_timeseries(strip_index, lake_gdf, tile_id)
-            ts_df, diag = build_buffer_corrected_timeseries(
-                strip_index, lake_gdf, tile_id, return_diagnostics=True,
-                ring_gap_frac=RING_GAP_FRAC, ring_width_frac=RING_WIDTH_FRAC)
-            # Manual-polygon time series (gapped ring), no outlier removal:
-            # the 2-sigma filter can delete real drainage points
-            ts_df.to_csv(os.path.join(run_dir, f"timeseries_manual_{lakename}.csv"), index=False)
-            try:
-                plot_polygon_timeseries(
-                    ts_df, lake_name=f"{lakename} (manual polygon)", remove_outliers=False,
-                    site_coords_4326=(lon, lat),
-                    output_path=os.path.join(run_dir, f"timeseries_manual_{lakename}.png"))
-                plot_lake_vs_background(
-                    ts_df, lake_name=lakename,
-                    output_path=os.path.join(run_dir, f"lake_vs_background_{lakename}.png"))
-            except Exception as e:
-                print(f"WARNING: time-series plot failed for {lakename}: {e}")
-            try:
-                strips_df, gaps_df = coverage_gap_report(lake_gdf, tile_id, strip_index, diag)
-                for df, name in ((strips_df, "coverage_strips.csv"), (gaps_df, "coverage_gaps.csv")):
-                    if len(df):
-                        df.insert(0, "lake_name", lakename)
-                        path = os.path.join(run_dir, name)
-                        df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
-                print(f"coverage gaps:\n{gaps_df.to_string(index=False) if len(gaps_df) else 'none'}")
-            except Exception as e:
-                print(f"WARNING: coverage gap report failed for {lakename}: {e}")
-            # print(f"DIAGNOSTICS: {diag[diag.status != 'kept']}")
-            print(diag['status'].value_counts())
-            print(f"mega-timeseries: {len(ts_df)} usable strips, "
-                f"median lake coverage {ts_df['n_valid_lake'].median():.0f} px")
-
-            if len(ts_df) < 3:
-                print(f"Not enough usable strips for {lake_gdf.lake_name} to detect an event, skipping")
-                qc_rows.append({"lake_name": lake_list_name, "status": "skipped",
-                                "reason": "fewer than 3 usable strips"})
-                pd.DataFrame(qc_rows).to_csv(qc_path, index=False)
-                continue
-
-            noise_floor = estimate_noise_floor_from_buffer(ts_df)
-            print(f"noise floor (from buffer ring, robust): {noise_floor:.3f} m")
-    
-            refined_windows = detect_event_window_from_series(
-                ts_df["date"], ts_df["corrected"], noise_floor, n_bkps=4
-            )
-            print(f"candidate windows (n_bkps=4): {refined_windows}")
-
-            # 1. Build a generous search region -- e.g. 2.5x your current polygon's radius
-            current_radius = np.sqrt(lake_gdf.geometry.area.iloc[0] / np.pi)
-            search_gdf = gpd.GeoDataFrame(
-                geometry=lake_gdf.geometry.buffer(current_radius * 1.5), crs=lake_gdf.crs
-            )
-            # 2. Plot the persistence map FIRST, before trusting any polygon it derives
-            auto_periods = sliding_windows_by_count(strip_index, strips_per_window=15, step_strips=7)
-            result = build_persistence_mask(
-                strip_index, search_gdf, tile_id, pixel_area=4.0,
-                lake_gdf=lake_gdf,
-                periods=auto_periods,  # or leave as None for n_periods split
-                # threshold_m=noise_floor * 2.5,      # tune this -- see caveats below
-                min_persistence_frac=0.5,
-                keep_strip_cache=True,  # reused by the epoch differences below
-            )
-            print(result["threshold_m_used"])
-            # 3. Outlines (per period + envelope), saved before plotting so a
-            #    plotting failure can't lose them; QC table rewritten per lake
-            # Minimum piece size for the superlake and the SD outline, as a
-            # fraction of the manual polygon's area (drops scattered noise)
-            min_piece_m2 = SUPERLAKE_MIN_FRAC * float(lake_gdf.geometry.area.iloc[0])
-            period_gdf, superlake_gdf = persistence_outlines(
-                result, search_gdf.crs, superlake_min_area_m2=min_piece_m2)
-            try:
-                sd_gdf, sd_thr, ring_gdf, sd_sens = sd_outline(
-                    result, lake_gdf, min_area_m2=min_piece_m2,
-                    ring_gap_frac=RING_GAP_FRAC, ring_width_frac=RING_WIDTH_FRAC,
-                    min_threshold_m=SD_MIN_THRESHOLD_M)
-                print(f"SD outline: threshold {sd_thr:.2f} m, {len(sd_gdf)} piece(s)")
-            except Exception as e:
-                print(f"WARNING: SD outline failed for {lakename}: {e}")
-                sd_gdf, sd_thr, ring_gdf, sd_sens = None, None, None, None
-            # Option B: outlines from differences between consecutive epochs
-            epoch_res = None
-            try:
-                epoch_res = build_epoch_differences(
-                    result["strip_cache"], strip_index, lake_gdf, result["ref_coords"],
-                    search_gdf.crs, epoch_days=EPOCH_DAYS,
-                    ring_gap_frac=RING_GAP_FRAC, ring_width_frac=RING_WIDTH_FRAC,
-                    min_abs_dz_m=EPOCH_MIN_ABS_DZ_M, min_piece_m2=min_piece_m2,
-                    cleaning=result["cleaning"])
-                ep = epoch_res["epochs_df"].assign(lake_name=lakename)
-                iv = epoch_res["intervals_df"].assign(lake_name=lakename)
-                for df, name in ((ep, "epochs.csv"), (iv, "epoch_intervals.csv")):
-                    path = os.path.join(run_dir, name)
-                    df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
-            except Exception as e:
-                print(f"WARNING: epoch differences failed for {lakename}: {e}")
-            # Compare contours: manual polygon and SD outlines (ring-based and
-            # fixed thresholds) -- time series, volumes, one GeoPackage each
-            try:
-                contours = {"manual": lake_gdf.to_crs(search_gdf.crs)}
-                if sd_gdf is not None and len(sd_gdf):
-                    contours[f"SD ring-based ({sd_thr:.2f} m)"] = sd_gdf
-                for thr in SD_FIXED_THRESHOLDS_M:
-                    g_thr, _, _, _ = sd_outline(result, lake_gdf, min_area_m2=min_piece_m2,
-                                                ring_gap_frac=RING_GAP_FRAC,
-                                                ring_width_frac=RING_WIDTH_FRAC,
-                                                sensitivity_thresholds_m=(),
-                                                fixed_threshold_m=thr)
-                    if len(g_thr):
-                        contours[f"SD >= {thr:g} m"] = g_thr
-                    g_out = g_thr.assign(lake_name=lakename, tile_id=tile_id, sd_threshold_m=thr)
-                    _append_gpkg_layer(os.path.join(run_dir, f"contours_sd_{thr:g}m.gpkg"),
-                                       "sd_outline", g_out)
-                if sd_gdf is not None and len(sd_gdf):
-                    _append_gpkg_layer(os.path.join(run_dir, "contours_sd_ring.gpkg"), "sd_outline",
-                                       sd_gdf.assign(lake_name=lakename, tile_id=tile_id,
-                                                     sd_threshold_m=sd_thr))
-                ts_by, vol_by, rows = {}, {}, []
-                for cname, cg in contours.items():
-                    ts_c = contour_timeseries(result["strip_cache"], strip_index, cg, ring_gdf,
-                                              result["ref_coords"])
-                    ts_by[cname] = ts_c
-                    if len(ts_c):
-                        rows.append(ts_c.assign(lake_name=lakename, contour=cname))
-                    if epoch_res is not None:
-                        v_c = contour_volumes(epoch_res, cg, result["ref_coords"])
-                        vol_by[cname] = v_c
-                        if len(v_c):
-                            path = os.path.join(run_dir, "contour_volumes.csv")
-                            v_c.assign(lake_name=lakename, contour=cname).to_csv(
-                                path, mode="a", header=not os.path.exists(path), index=False)
-                if rows:
-                    path = os.path.join(run_dir, "contour_timeseries.csv")
-                    pd.concat(rows).to_csv(path, mode="a", header=not os.path.exists(path),
-                                           index=False)
-                plot_contour_comparison(ts_by, vol_by, lake_name=lakename, output_dir=run_dir)
-            except Exception as e:
-                print(f"WARNING: contour comparison failed for {lakename}: {e}")
-            result["strip_cache"] = None  # free the cropped strips
-            gc.collect()
-            try:
-                export_persistence_gpkg(
-                    gpkg_path, lakename, tile_id, lake_gdf, search_gdf,
-                    result, period_gdf, superlake_gdf,
-                    sd_outline_gdf=sd_gdf, ring_gdf=ring_gdf,
-                    epoch_outlines_gdf=epoch_res["outlines_gdf"] if epoch_res else None,
-                    epoch_superlake_gdf=epoch_res["superlake_gdf"] if epoch_res else None)
-            except Exception as e:
-                print(f"WARNING: GeoPackage export failed for {lakename}: {e}")
-            try:
-                ice = lake_ice_thickness(lake_gdf)
-            except Exception as e:
-                print(f"WARNING: ice thickness failed for {lakename}: {e}")
-                ice = {"ice_thickness_m": np.nan, "ice_thickness_centroid_m": np.nan,
-                       "bed_error_m": np.nan}
-            qc_rows.append({"lake_name": lakename, "tile_id": tile_id, "status": "ok",
-                            "ice_thickness_centroid_m": ice["ice_thickness_centroid_m"],
-                            "bed_error_m": ice["bed_error_m"],
-                            **persistence_qc(result, lake_gdf, search_gdf,
-                                             superlake_gdf=superlake_gdf,
-                                             sd_outline_gdf=sd_gdf,
-                                             sd_threshold_m=sd_thr,
-                                             sd_sensitivity_df=sd_sens,
-                                             epoch_res=epoch_res)})
-            qc_rows[-1] = add_d_over_h(qc_rows[-1], ice["ice_thickness_m"])
-            pd.DataFrame(qc_rows).to_csv(qc_path, index=False)
-            print(f"QC table updated: {qc_path}")
-            # 4. Diagnostics figures
-            plot_persistence_diagnostics(result, lake_gdf, search_gdf, lake_name=lakename,
-                                         output_dir=run_dir,
-                                         period_gdf=period_gdf, superlake_gdf=superlake_gdf,
-                                         sd_outline_gdf=sd_gdf, sd_threshold_m=sd_thr,
-                                         ring_gdf=ring_gdf,
-                                         epoch_superlake_gdf=(epoch_res["superlake_gdf"]
-                                                              if epoch_res else None))
-            if epoch_res is not None:
-                plot_epoch_differences(epoch_res, lake_gdf, search_gdf, result["ref_coords"],
-                                       lake_name=lakename, output_dir=run_dir)
-            del result, period_gdf, superlake_gdf, epoch_res
-            gc.collect()
-        except Exception as e:
-            # One lake failing (no coverage, no usable periods, ...) must not
-            # stop the run: record why and move on
-            reason = f"{type(e).__name__}: {e}"
-            print(f"SKIPPED {lake_list_name}: {reason}")
-            qc_rows.append({"lake_name": lake_list_name, "status": "skipped",
-                            "reason": reason})
-            pd.DataFrame(qc_rows).to_csv(qc_path, index=False)
-            gc.collect()
-
-    if qc_rows:
-        print(pd.DataFrame(qc_rows).round(2).to_string())
