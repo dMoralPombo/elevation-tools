@@ -55,12 +55,12 @@ Then open a notebook in `notebooks/`, in Jupyter or in the VSCode Interactive wi
 ### Lake volume notebook (03)
 
 `03_volume.ipynb` works on one lake at a time, from a polygon file (one polygon per lake). Its default file holds the current candidate lakes. The steps:
-1. **Stack:** it lists the tile's zarr stacks and picks one. Rebuilt stacks (`_rs` in the folder name) come first; set `REFERENCE` to `'cs2'` or `'mosaic'` when a tile has both.
+1. **Stack:** it lists the tile's zarr stacks and picks one, preferring stacks made with the current coregistration scheme (ICESat-2 where available, CryoSat-2 otherwise; folders starting `is2_`). `REFERENCE` chooses between `'altim'` (default), `'is2'`, `'cs2'` and `'mosaic'`.
 2. **Time series:** lake-mean elevation minus a background ring, for every strip.
 3. **Ice thickness:** BedMachine thickness and the lake's d/H.
 4. **Outline and events** (optional, a few minutes): an SD-based outline, and the drain/fill events between observations with their volumes.
 
-Outputs go to `OUTPUT_DIR/volume/notebook_<lake>_<date>/`. Results from stacks not yet rebuilt (no `_rs` in the name) are provisional.
+Outputs go to `OUTPUT_DIR/volume/notebook_<lake>_<date>/`. Results from stacks made with the older scheme are provisional; the notebook says which kind it picked.
 
 ## How the notebooks work
 

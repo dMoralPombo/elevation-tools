@@ -32,7 +32,8 @@ import rasterio.features
 import rasterio.transform
 from shapely.geometry import shape
 
-from config import OUTPUT_DIR, ARCHIVE_DIR, LUNA_ROOT, ARCTICDEM_ROOT, get_mosaic_index_path
+from config import (OUTPUT_DIR, ARCHIVE_DIR, LUNA_ROOT, ARCTICDEM_ROOT, COREG_PARAMS,
+                    get_mosaic_index_path)
 
 # All plots from this workflow go here (was: the current working directory)
 VOLUME_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "volume")
@@ -252,73 +253,103 @@ def list_tile_zarr_subfolders(tile_id, base_dir=TILE_ZARR_BASE):
     return sorted(names)
 
 
+def stack_reference(name):
+    """
+    Coregistration reference of a stack folder name: 'is2' (the --prefer is2
+    scheme: ICESat-2 with Nuth-Kaab where IS2 data exist, CS2 without NK for
+    the rest; names start "is2_" and contain "_cs2fb20m"), 'cs2', 'mosaic',
+    'nocoreg', or the name itself if unrecognised. Megatile folders
+    ("megatile/<tile>_cs2") are matched too. "is2" is tested before "cs2"
+    because the is2 names contain "cs2fb20m".
+    """
+    base = name.split("/")[-1]
+    if "nocoreg" in base:
+        return "nocoreg"
+    if base.startswith("is2_"):
+        return "is2"
+    if "cs2" in base:
+        return "cs2"
+    if "mosaic" in base:
+        return "mosaic"
+    return name
+
+
+def is_current_chain(name):
+    """
+    True for stacks coregistered with the scheme in force since 6-11 Nov 2026
+    (notes/HUB.md section 3): the is2 scheme, or CS2/mosaic without Nuth-Kaab
+    (chain "vertical_offset_mean_deramp"). False for the old chain with
+    Nuth-Kaab ("..._nuthkaab_deramp", including "_nkfb20m" stacks) and for
+    older names that don't record the chain (megatile copies, "zarr_coreg_...").
+    """
+    ref = stack_reference(name)
+    if ref == "is2":
+        return True
+    return ref in ("cs2", "mosaic") and "_vertical_offset_mean_deramp" in name
+
+
 def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE, reference=None):
     """
-    Applies your stated preferences to the raw subfolder list:
-    0. "nocoreg" (no coregistration) is dropped whenever a cs2/mosaic
-       folder exists, and cs2/mosaic are recognised anywhere in the
-       folder name (e.g. "12_39_1_2_cs2").
-    1. "outliersout" (filters strips with SD > 50 m) is ALWAYS preferred
-       over the equivalent non-outliersout variant of the same reference
-       pipeline (cs2 or mosaic) -- collapsed automatically, no ambiguity.
-       Rebuilt "_rs" stacks come before older ones whatever their outlier
-       setting, since the older stacks predate the GLOBE stacking fixes.
-       Among rebuilt stacks, the Nuth & Kaab fallback ("_nkfb20m": strips
-       shifted > 20 m redone without Nuth & Kaab) comes first. Stacks
-       detrended with the smoothed dh/dt grid ("_dtg...") and per-segment
-       stacks ("_seg") are only used when nothing else exists: the grid
-       may absorb part of a lake's signal, and segments of one strip pair
-       aren't merged before the lake-coverage filter yet. Pass `subfolder`
-       explicitly to use one of them anyway.
-       Then the tile's own folders, and the megatile copy (which keeps
-       outliers) only when the tile folder has no stack of that reference.
-    2. cs2 (CryoSat-2-referenced) vs mosaic (ArcticDEM-mosaic-referenced)
-       has NO fixed preference -- your stated rule depends on the tile's
-       proximity to the coastline/ice-sheet edge (enough exposed bedrock
-       for reliable mosaic coregistration vs. relying on altimetry alone
-       further inland). That's geographic judgement this function doesn't
-       have, so if both remain after step 1, it still raises rather than
-       guessing -- you decide per tile based on that heuristic.
+    Picks the stack folder to use for a tile.
 
-    reference: 'cs2' or 'mosaic' to make the step-2 choice here (only
-    stacks with that reference are considered).
+    reference -- which coregistration reference to use:
+      'altim'  : the altimetry stacks: the is2 scheme (--prefer is2) if the tile
+                 has one, otherwise CS2 (default of the batch run and notebook);
+      'is2'    : only is2-scheme stacks;
+      'cs2'    : only CS2 stacks;
+      'mosaic' : only mosaic stacks (bedrock-rich tiles only);
+      None     : decide from what exists: is2 beats cs2 (it supersedes it,
+                 hub section 3), but altimetry vs mosaic is a per-tile choice,
+                 so it raises if both remain.
 
-    Returns the single resolved subfolder name if unambiguous; raises
-    listing the remaining choice(s) otherwise.
+    Within the chosen reference, stacks are ranked:
+      1. dh/dt-grid ("_dtg...") and per-segment ("_seg") stacks last, used only
+         when nothing else exists (the grid may absorb part of a lake's
+         signal; segments of one pair aren't merged before the lake-coverage
+         filter yet). Pass the folder explicitly to use one of them anyway;
+      2. the current chain first (is2 scheme, or CS2/mosaic without
+         Nuth-Kaab), then the old Nuth-Kaab chain (including "_nkfb20m",
+         which gets no special preference any more);
+      3. rebuilt "_rs" stacks before older ones;
+      4. "outliersout" before outliers kept;
+      5. the tile's own folders before the megatile copy (which keeps outliers).
+    Uncoregistered ("nocoreg") stacks are used only when nothing else exists.
+
+    Returns the folder name (megatile ones as "megatile/<name>"); raises if a
+    choice remains, listing the options.
     """
+    if reference not in (None, "altim", "is2", "cs2", "mosaic"):
+        raise ValueError(f"reference must be 'altim', 'is2', 'cs2', 'mosaic' or None, "
+                         f"not {reference!r}")
     available = list_tile_zarr_subfolders(tile_id, base_dir)
-
-    def reference_type(name):
-        # matched anywhere in the name: folders like "12_39_1_2_cs2" or
-        # "zarr_coreg_cs2_..." are cs2 too
-        if "nocoreg" in name:
-            return "nocoreg"
-        if "cs2" in name:
-            return "cs2"
-        if "mosaic" in name:
-            return "mosaic"
-        return name  # unrecognised naming -- treat as its own group, don't guess
 
     by_reference = {}
     for name in available:
-        by_reference.setdefault(reference_type(name), []).append(name)
+        by_reference.setdefault(stack_reference(name), []).append(name)
 
-    if reference is not None:
-        if reference not in by_reference:
+    if reference == "altim":
+        wanted = "is2" if "is2" in by_reference else "cs2"
+    else:
+        wanted = reference
+    if wanted is not None:
+        if wanted not in by_reference:
             raise ValueError(f"tile {tile_id} has no {reference} stack; available: "
                              f"{available}")
-        by_reference = {reference: by_reference[reference]}
+        by_reference = {wanted: by_reference[wanted]}
 
     # Uncoregistered data is only a last resort: drop it whenever a
-    # coregistered (cs2/mosaic) alternative exists
-    if "nocoreg" in by_reference and ({"cs2", "mosaic"} & set(by_reference)):
+    # coregistered alternative exists
+    if "nocoreg" in by_reference and len(by_reference) > 1:
         by_reference.pop("nocoreg")
+    # The is2 scheme supersedes plain CS2 (it falls back to CS2 itself)
+    if "is2" in by_reference and "cs2" in by_reference:
+        by_reference.pop("cs2")
 
     collapsed = []
     for ref, names in by_reference.items():
         names = sorted(names, key=lambda n: (bool(_SPECIAL_VARIANT_RX.search(n)),
+                                             not is_current_chain(n),
                                              not _RS_TAG_RX.search(n),
-                                             "_nkfb" not in n,
                                              "outliersout" not in n,
                                              n.startswith(f"{MEGATILE_SUBDIR}/")))
         collapsed.append(names[0])
@@ -328,13 +359,13 @@ def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE, reference=None)
         if "nocoreg" in chosen:
             print(f"WARNING: tile {tile_id}'s only available subfolder "
                   f"({chosen}) has NO coregistration applied -- this is a "
-                  f"substantively noisier product than the cs2/mosaic-"
-                  f"referenced data used elsewhere. Results for this tile "
-                  f"should be treated as lower-confidence unless a "
-                  f"coregistered alternative genuinely doesn't exist.")
-        if not _RS_TAG_RX.search(chosen) and "nocoreg" not in chosen:
-            print(f"note: tile {tile_id} has no rebuilt (_rs) stack yet; "
-                  f"using the older {chosen}")
+                  f"substantively noisier product than the coregistered data "
+                  f"used elsewhere. Results for this tile should be treated "
+                  f"as lower-confidence.")
+        elif not is_current_chain(chosen):
+            print(f"note: tile {tile_id} has no stack with the current "
+                  f"coregistration scheme yet; using {chosen} (old chain, "
+                  f"results provisional)")
         if _SPECIAL_VARIANT_RX.search(chosen):
             print(f"note: tile {tile_id} only has a dh/dt-grid or per-segment "
                   f"stack ({chosen}); see select_preferred_subfolder")
@@ -344,9 +375,10 @@ def select_preferred_subfolder(tile_id, base_dir=TILE_ZARR_BASE, reference=None)
         return chosen
 
     raise ValueError(
-        f"tile {tile_id}: outliersout preference applied, but still need a "
-        f"cs2-vs-mosaic choice based on proximity to the ice-sheet edge -- "
-        f"pick explicitly from: {collapsed}"
+        f"tile {tile_id}: both altimetry and mosaic stacks exist, so the "
+        f"reference is a per-tile choice (mosaic only where bedrock is "
+        f"plentiful) -- pass reference='altim' or 'mosaic', or pick a folder "
+        f"from: {collapsed}"
     )
 
 
@@ -381,9 +413,8 @@ def build_strip_index(tile_id, subfolder=None, reference=None):
     subfolder: which processing-variant folder to read strips from (e.g.
     "cs2_v_999_dh_999_vertical_offset_mean_nuthkaab_deramp_outliersout_50m").
     If omitted, uses select_preferred_subfolder() -- auto-resolves the
-    outliersout preference, but still raises if a cs2-vs-mosaic choice
-    remains (that depends on the tile's proximity to the ice-sheet edge,
-    which this function doesn't know).
+    stack ranking, but still raises if an altimetry-vs-mosaic choice remains
+    (pass reference='altim', 'is2', 'cs2' or 'mosaic'; see that function).
     """
     if subfolder is None:
         subfolder = select_preferred_subfolder(tile_id, reference=reference)
@@ -2060,7 +2091,16 @@ def coverage_gap_report(lake_gdf, tile_id, strip_index, ts_diag, subfolder=None,
 
     if subfolder is None:
         subfolder = select_preferred_subfolder(tile_id)
-    ref = "mosaic" if "mosaic" in subfolder else "altim"  # cs2 -> altim
+    ref = "mosaic" if stack_reference(subfolder) == "mosaic" else "altim"  # cs2 -> altim
+    # find_strip_file looks for the GeoTIFFs of config.COREG_PARAMS[ref]; that
+    # only says something about this stack if the stack used the same chain
+    # (is2-scheme and no-NK stacks don't, until COREG_PARAMS is updated)
+    chain = "_" + COREG_PARAMS[ref]["coreg_choice"].replace(" ", "_") + "_"
+    check_coreg = (stack_reference(subfolder) in ("cs2", "mosaic")
+                   and chain in subfolder.split("/")[-1] + "_")
+    if not check_coreg:
+        print(f"note: coreg_in_archive not checked: {subfolder} doesn't use the "
+              f"chain in config.COREG_PARAMS['{ref}']")
 
     lake4326 = lake_gdf.to_crs("EPSG:4326")
     geom = lake4326.geometry.union_all()
@@ -2091,7 +2131,8 @@ def coverage_gap_report(lake_gdf, tile_id, strip_index, ts_diag, subfolder=None,
             "is_xtrack": bool(it.get("pgc:is_xtrack", False)),
             "cloud_fraction": it.get("pgc:cloud_area_percent", np.nan),
             "raw_in_archive": find_strip_file(ARCHIVE_DIR, geocell, sid, "none") is not None,
-            "coreg_in_archive": find_strip_file(ARCHIVE_DIR, geocell, sid, ref) is not None,
+            "coreg_in_archive": (find_strip_file(ARCHIVE_DIR, geocell, sid, ref) is not None
+                                 if check_coreg else np.nan),
             "in_zarr": _pair_in(pair, zarr_pairs),
             "zarr_data_over_lake": _pair_in(pair, kept_pairs),
         })
@@ -2102,6 +2143,8 @@ def coverage_gap_report(lake_gdf, tile_id, strip_index, ts_diag, subfolder=None,
     t_hi = pd.Timestamp(time_range.split("/")[1])
     edges = [t_lo] + list(kept_dates) + [t_hi]
     stages = ["raw_in_archive", "coreg_in_archive", "in_zarr", "zarr_data_over_lake"]
+    if not check_coreg:
+        stages.remove("coreg_in_archive")
     reasons = {"n_catalogue": "no strips acquired",
                "raw_in_archive": "not downloaded to archive",
                "coreg_in_archive": "not coregistered",

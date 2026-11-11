@@ -49,10 +49,13 @@ if __name__ == "__main__":
     EPOCH_DAYS = 30            # strips within 30 days of an epoch's first strip form one epoch
     EPOCH_MIN_ABS_DZ_M = None  # floor for the epoch-difference threshold (m)
     SD_FIXED_THRESHOLDS_M = (2.0, 3.0, 5.0)  # extra SD contours compared per lake
-    # Coregistration reference per tile, where a tile has both cs2 and mosaic
-    # stacks (the user's rule: mosaic where there's enough bedrock nearby)
+    # Coregistration reference per tile (select_preferred_subfolder): 'altim'
+    # = the --prefer is2 stack if the tile has one, otherwise CS2 (the scheme in
+    # force, notes/HUB.md section 3); 'mosaic' only where bedrock is plentiful.
+    # The thin-ice Sermeq tiles stay on mosaic until the mosaic-vs-is2
+    # comparison is done (hub section 8).
     TILE_REFERENCE = {"11_38_2_2": "mosaic", "12_38_1_2": "mosaic", "12_38_2_2": "mosaic"}
-    DEFAULT_REFERENCE = "cs2"
+    DEFAULT_REFERENCE = "altim"
     # Each run writes to its own folder: files from earlier runs that are
     # open elsewhere (Windows locks them) are never touched
     from datetime import datetime
