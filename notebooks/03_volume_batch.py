@@ -275,8 +275,20 @@ if __name__ == "__main__":
                 print(f"WARNING: ice thickness failed for {lakename}: {e}")
                 ice = {"ice_thickness_m": np.nan, "ice_thickness_centroid_m": np.nan,
                        "bed_error_m": np.nan}
+            # Non-ice ground (GrIMP): masked out of the background ring, flagged in the lake
+            ring_masked = build_background_ring(
+                lake_gdf, RING_GAP_FRAC, RING_WIDTH_FRAC).attrs["nonice_masked_frac"]
+            lake_nonice = nonice_fraction(lake_gdf)
+            nonice_flags = "; ".join(
+                f for f, bad in ((f"{ring_masked:.0%} of the ring non-ice (masked)",
+                                  ring_masked > NONICE_FLAG_FRAC),
+                                 (f"{lake_nonice:.0%} of the lake non-ice (GrIMP)",
+                                  lake_nonice > NONICE_FLAG_FRAC)) if bad)
             qc_rows.append({"lake_name": lakename, "tile_id": tile_id, "status": "ok",
                             "stack": subfolder,
+                            "ring_nonice_masked_frac": round(ring_masked, 3),
+                            "lake_nonice_frac": round(lake_nonice, 3),
+                            "nonice_flags": nonice_flags,
                             "ice_thickness_centroid_m": ice["ice_thickness_centroid_m"],
                             "bed_error_m": ice["bed_error_m"],
                             **persistence_qc(result, lake_gdf, search_gdf,

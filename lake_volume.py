@@ -1673,7 +1673,77 @@ def persistence_outlines(result, crs, superlake_min_area_m2=0.0):
     return period_gdf, superlake_gdf
 
 
-def build_background_ring(lake_gdf, gap_frac=0.5, width_frac=1.0, tile_crs=None):
+# GrIMP 15 m ice mask (2015; 1 = ice), the mask DEMSquad uses to pick its
+# bedrock control points. Non-ice ground (rock, water, ocean) is kept out of
+# the background rings. Caveat for the Methods: it shows the 2015 ice edge, so
+# ground deglaciated since then still counts as ice (retreating margins only).
+GRIMP_DIR = os.getenv("GRIMP_DIR", os.path.join(LUNA_ROOT, "demsquad", "Greenland", "GrIMP"))
+GRIMP_LOOKUP = os.path.join(GRIMP_DIR, "GIMP_rast_database_cpom2.parquet")
+NONICE_DILATE_M = 30.0    # grow the non-ice area by two GrIMP pixels (mixed edge pixels)
+NONICE_FLAG_FRAC = 0.20   # flag a ring or lake with more than 20 % non-ice
+
+
+@lru_cache(maxsize=64)
+def _nonice_geometry(bounds, dilate_m=NONICE_DILATE_M):
+    """
+    Non-ice area (GrIMP ice mask == 0) inside bounds (left, bottom, right,
+    top; EPSG:3413), as one shapely geometry grown by dilate_m. Empty if no
+    GrIMP tile covers the bounds.
+    """
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+    from rasterio.windows import from_bounds
+    left, bottom, right, top = bounds
+    db = pd.read_parquet(GRIMP_LOOKUP)
+    tiles = db[(db["I_O"] == 1) & (db["Minx"] < right) & (db["Maxx"] > left)
+               & (db["Miny"] < top) & (db["Maxy"] > bottom)]
+    pieces = []
+    for rel in tiles["Filepath"]:
+        with rasterio.open(os.path.join(GRIMP_DIR, rel)) as src:
+            win = from_bounds(left, bottom, right, top, src.transform).round_offsets().round_lengths()
+            win = win.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
+            ice = src.read(1, window=win)
+            nonice = (ice == 0)
+            if not nonice.any():
+                continue
+            for geom, _ in rasterio.features.shapes(nonice.astype("uint8"), mask=nonice,
+                                                     transform=src.window_transform(win)):
+                pieces.append(shape(geom))
+    if not pieces:
+        return box(0, 0, 0, 0).buffer(0)  # empty
+    g = unary_union(pieces)
+    return g.buffer(dilate_m) if dilate_m else g
+
+
+def nonice_fraction(geom_or_gdf):
+    """Share of an area (EPSG:3413) that GrIMP marks as non-ice (no dilation)."""
+    geom = (geom_or_gdf.geometry.union_all() if hasattr(geom_or_gdf, "geometry")
+            else geom_or_gdf)
+    if geom.is_empty or geom.area == 0:
+        return np.nan
+    ng = _nonice_geometry(tuple(round(v, 1) for v in geom.bounds), dilate_m=0.0)
+    return float(geom.intersection(ng).area / geom.area)
+
+
+def mask_nonice(geom, label=""):
+    """
+    Removes GrIMP non-ice ground (grown by NONICE_DILATE_M) from a background
+    ring geometry (EPSG:3413). Returns (masked geometry, share of the ring
+    removed) and prints a flag when more than NONICE_FLAG_FRAC is removed.
+    """
+    if geom.is_empty or geom.area == 0:
+        return geom, 0.0
+    ng = _nonice_geometry(tuple(round(v, 1) for v in geom.bounds))
+    masked = geom.difference(ng) if not ng.is_empty else geom
+    frac = 1.0 - masked.area / geom.area
+    if frac > NONICE_FLAG_FRAC:
+        print(f"FLAG{' ' + label if label else ''}: {frac:.0%} of the background ring is "
+              f"non-ice (GrIMP) and was masked out")
+    return masked, frac
+
+
+def build_background_ring(lake_gdf, gap_frac=0.5, width_frac=1.0, tile_crs=None,
+                          exclude_nonice=True):
     """
     Background ring for thresholds, kept away from the lake: it starts
     gap_frac x r outside the manual polygon and is width_frac x r wide,
@@ -1681,6 +1751,12 @@ def build_background_ring(lake_gdf, gap_frac=0.5, width_frac=1.0, tile_crs=None)
     for lake area outside the hand-drawn outline, so it doesn't inflate the
     background statistics. gap_frac=0, width_frac=1 is the Fan et al. 2023
     ring (build_lake_buffer_ring).
+
+    exclude_nonice: remove non-ice ground (GrIMP ice mask, grown by
+    NONICE_DILATE_M) from the ring, so detrended bedrock elevations don't
+    enter the background. The removed share is in ring_gdf.attrs
+    ["nonice_masked_frac"] and is flagged above NONICE_FLAG_FRAC. Only rings
+    at the ice margin are affected (in Nov 2026: the Sermeq SW/Centre/NE rings).
 
     Note the search region used by build_persistence_mask is the polygon
     buffered by 1.5 r, so gap_frac + width_frac <= 1.5 keeps the ring
@@ -1693,7 +1769,17 @@ def build_background_ring(lake_gdf, gap_frac=0.5, width_frac=1.0, tile_crs=None)
     r = float(np.sqrt(lake_gdf.geometry.area.iloc[0] / np.pi))
     inner = lake_gdf.geometry.buffer(gap_frac * r) if gap_frac > 0 else lake_gdf.geometry
     outer = lake_gdf.geometry.buffer((gap_frac + width_frac) * r)
-    return gpd.GeoDataFrame(geometry=outer.difference(inner), crs=lake_gdf.crs)
+    ring = outer.difference(inner)
+    frac = 0.0
+    if exclude_nonice:
+        if lake_gdf.crs is not None and lake_gdf.crs.to_epsg() != 3413:
+            raise ValueError("exclude_nonice needs the ring in EPSG:3413 (GrIMP's CRS)")
+        label = str(lake_gdf["lake_name"].iloc[0]) if "lake_name" in lake_gdf.columns else ""
+        masked, frac = mask_nonice(ring.union_all(), label=label)
+        ring = gpd.GeoSeries([masked], crs=lake_gdf.crs)
+    ring_gdf = gpd.GeoDataFrame(geometry=ring.values, crs=lake_gdf.crs)
+    ring_gdf.attrs["nonice_masked_frac"] = frac
+    return ring_gdf
 
 
 def _ring_mask(ring_gdf, ref_coords, shape):
