@@ -369,8 +369,14 @@ def process_elevation_profiles(
         'year_span': year_span(time_range, [extract_year(p) for p in pairnames]),
     }
 
-    # Add the mosaic transect first, if available
-    transect_mosaic, profile_mosaic, transect_distance, x0, y0, x1, y1 = (transect_from_mosaic(transect_coords, num_samples=100))
+    # Add the mosaic transect first, if available. It is optional: a missing
+    # tile, index or unreadable file is flagged and the strips still run.
+    try:
+        transect_mosaic, profile_mosaic, transect_distance, x0, y0, x1, y1 = (
+            transect_from_mosaic(transect_coords, num_samples=100))
+    except Exception as e:
+        print(f"⚠ Mosaic profile skipped ({type(e).__name__}: {e}); continuing with the strips.")
+        transect_mosaic = profile_mosaic = transect_distance = x0 = y0 = x1 = y1 = None
 
     # Store mosaic profile
     all_profiles['mosaic'] = {
