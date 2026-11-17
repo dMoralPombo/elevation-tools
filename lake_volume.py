@@ -30,7 +30,7 @@ import matplotlib.dates as mdates
 import rasterio
 import rasterio.features
 import rasterio.transform
-from shapely.geometry import shape
+from shapely.geometry import box, shape
 
 from config import (OUTPUT_DIR, ARCHIVE_DIR, LUNA_ROOT, ARCTICDEM_ROOT, COREG_PARAMS,
                     get_mosaic_index_path)
@@ -741,7 +741,8 @@ def build_lake_buffer_ring(lake_gdf, buffer_dist_m=None, inner_gap_m=0, tile_crs
 def build_buffer_corrected_timeseries(strip_index, lake_gdf, tile_id,
                                        buffer_dist_m=None, inner_gap_m=0,
                                        nodata=-9999.0, return_diagnostics=False,
-                                       ring_gap_frac=None, ring_width_frac=1.0):
+                                       ring_gap_frac=None, ring_width_frac=1.0,
+                                       ring_gdf=None):
     """
     Per strip: crops both the lake polygon and its surrounding buffer ring,
     and records the ring's mean as a local background estimate. "corrected"
@@ -771,11 +772,19 @@ def build_buffer_corrected_timeseries(strip_index, lake_gdf, tile_id,
     (build_background_ring: starts ring_gap_frac x r outside the polygon,
     ring_width_frac x r wide), keeping lake area outside the hand-drawn
     outline out of the background. None = Fan et al. ring (no gap).
+
+    ring_gdf: a ready-made background ring (e.g. sd_lake_outline's, built
+    from the manual polygon) used instead of building one; the lake
+    polygon is cut out of it. Overrides ring_gap_frac/buffer_dist_m.
     """
     _, tile_crs = get_tile_transform(tile_id)
     if lake_gdf.crs != tile_crs:
         lake_gdf = lake_gdf.to_crs(tile_crs)  # do this ONCE, before buffering
-    if ring_gap_frac is not None:
+    if ring_gdf is not None:
+        ring = ring_gdf.to_crs(tile_crs).geometry.union_all().difference(
+            lake_gdf.geometry.union_all())
+        buffer_gdf = gpd.GeoDataFrame(geometry=[ring], crs=tile_crs)
+    elif ring_gap_frac is not None:
         buffer_gdf = build_background_ring(lake_gdf, ring_gap_frac, ring_width_frac,
                                            tile_crs=tile_crs)
     else:
@@ -1852,6 +1861,168 @@ def sd_outline(result, lake_gdf, n_mad=3.0, min_valid=3, min_area_m2=0.0,
     return outline_gdf, threshold, ring_gdf, pd.DataFrame(sens)
 
 
+# The lake used for every result since 16 Nov 2026 (notes/HUB.md section 3):
+# the SD outline, threshold = SD_OUTLINE_PCT-th percentile of the SD map
+# (Gaussian-smoothed SD_OUTLINE_SMOOTH_M) inside the background ring
+SD_OUTLINE_PCT = 99.0
+SD_OUTLINE_SMOOTH_M = 20.0
+# If more than this share of the SD outline lies inside the ring (built from
+# the manual polygon), the ring is rebuilt around the SD outline and the
+# outline redone once; that second outline is final. With a p99 threshold
+# at most ~1 % of ring pixels can pass, so this is a safeguard: in Nov 2026
+# no lake came near it (largest share 2.4 %, Candidate #6).
+RING_OVERLAP_MAX_FRAC = 0.05
+# Flag thresholds against the manual polygon
+SD_FLAG_MIN_IOU = 0.5
+SD_FLAG_AREA_RATIO = (0.5, 2.0)
+# An epoch interval is a lake event (fill/drain) when the lake-mean dz is
+# beyond the interval's detection threshold (3 x the ring's robust sigma of
+# dz, build_epoch_differences) and at least EVENT_MIN_DZ_M, with at least
+# EVENT_MIN_COVERAGE of the lake observed (the 05_summary.py rule)
+EVENT_MIN_DZ_M = 2.0
+EVENT_MIN_COVERAGE = 0.5
+
+
+def smooth_nan(a, sigma_m, pixel_m):
+    """Gaussian smoothing that ignores gaps (sigma in metres); 0/None = no smoothing."""
+    if not sigma_m:
+        return a
+    from scipy.ndimage import gaussian_filter
+    s = sigma_m / pixel_m
+    ok = np.isfinite(a)
+    num = gaussian_filter(np.where(ok, a, 0.0), s)
+    den = gaussian_filter(ok.astype("float32"), s)
+    return np.where(den > 0.5, num / np.maximum(den, 1e-6), np.nan)
+
+
+def sd_lake_outline(result, lake_gdf, pct=SD_OUTLINE_PCT, smooth_m=SD_OUTLINE_SMOOTH_M,
+                    min_valid=3, min_area_m2=0.0, ring_gap_frac=0.5, ring_width_frac=1.0,
+                    max_ring_overlap=RING_OVERLAP_MAX_FRAC):
+    """
+    The lake outline used for the time series, epoch differences and
+    volumes (decided 16 Nov 2026): pixels whose whole-record elevation SD,
+    smoothed with a Gaussian of smooth_m metres, is at least the pct-th
+    percentile of the smoothed SD inside the background ring. The ring
+    (build_background_ring) is built from the manual polygon, with non-ice
+    ground masked out. Cleaned like the other outlines; pieces smaller than
+    min_area_m2 are dropped. Same rule as fig2_methods.py and
+    export_sd_outlines.py.
+
+    Ring check: if more than max_ring_overlap of the outline lies inside the
+    ring, the ring is rebuilt around the outline (same gap and width, from
+    the outline's equivalent radius) and the outline redone once; the
+    second outline is final. A rebuilt ring can reach past the cropped
+    search region; the share outside is flagged.
+
+    result: build_persistence_mask() output (sd_map, n_valid_map,
+    ref_coords, cleaning, candidate_gdf).
+
+    Returns a dict:
+      outline_gdf  one row (lake_name, threshold_m, area_m2), or empty
+      threshold_m, ring_gdf (the ring used for the final outline),
+      ring_source ("manual" or "sd outline"), ring_overlap_first,
+      ring_overlap (final), ring_nonice_masked_frac, iou_manual,
+      area_ratio, pieces_off_manual, lake_nonice_frac, flags (list of str)
+    """
+    from shapely.ops import unary_union
+    crs = result["candidate_gdf"].crs
+    ref = result["ref_coords"]
+    lake_gdf = lake_gdf.to_crs(crs)
+    name = str(lake_gdf["lake_name"].iloc[0]) if "lake_name" in lake_gdf.columns else ""
+    manual = lake_gdf.geometry.union_all()
+    sd = np.where(result["n_valid_map"] >= min_valid, result["sd_map"], np.nan)
+    sd_s = smooth_nan(sd, smooth_m, abs(float(ref[0][1] - ref[0][0])))
+    filled = np.nan_to_num(sd_s, nan=-np.inf)
+    c = result["cleaning"]
+    min_piece = max(min_area_m2, c["min_area_m2"])
+
+    def attempt(base_gdf):
+        ring_gdf = build_background_ring(base_gdf, ring_gap_frac, ring_width_frac, tile_crs=crs)
+        vals = sd_s[_ring_mask(ring_gdf, ref, sd_s.shape) & np.isfinite(sd_s)]
+        if vals.size < 20:
+            raise ValueError("Too few valid pixels in the background ring to set an SD threshold")
+        thr = float(np.percentile(vals, pct))
+        mask = _clean_mask(filled >= thr, c["morph_closing_px"], c["morph_opening_px"])
+        polys, _ = _mask_to_polygons(mask, ref, min_piece)
+        geom = unary_union(polys) if polys else None
+        overlap = (geom.intersection(ring_gdf.geometry.union_all()).area / geom.area
+                   if geom is not None else 0.0)
+        return ring_gdf, thr, geom, overlap
+
+    ring_gdf, thr, geom, overlap = attempt(lake_gdf)
+    out = {"ring_source": "manual", "ring_overlap_first": overlap,
+           "ring_nonice_masked_frac": ring_gdf.attrs.get("nonice_masked_frac", 0.0)}
+    flags = []
+    if geom is not None and overlap > max_ring_overlap:
+        sd_gdf = gpd.GeoDataFrame({"lake_name": [name]}, geometry=[geom], crs=crs)
+        ring_gdf, thr, geom2, overlap = attempt(sd_gdf)
+        out["ring_source"] = "sd outline"
+        flags.append(f"ring rebuilt from the SD outline ({out['ring_overlap_first']:.0%} of it "
+                     f"was in the manual-based ring)")
+        x, y = ref
+        crop = box(min(x), min(y), max(x), max(y))
+        ring_geom = ring_gdf.geometry.union_all()
+        outside = ring_geom.difference(crop).area / ring_geom.area if ring_geom.area else 0.0
+        if outside > 0.05:
+            flags.append(f"rebuilt ring {outside:.0%} outside the cropped region")
+        geom = geom2
+        if geom is not None and overlap > max_ring_overlap:
+            flags.append(f"outline still {overlap:.0%} inside the rebuilt ring")
+        out["ring_nonice_masked_frac"] = ring_gdf.attrs.get("nonice_masked_frac", 0.0)
+
+    if geom is None or geom.is_empty:
+        outline_gdf = gpd.GeoDataFrame({"lake_name": [], "threshold_m": [], "area_m2": []},
+                                       geometry=[], crs=crs)
+        flags.insert(0, f"no SD outline (ring p{pct:g} threshold {thr:.1f} m)")
+        out.update(iou_manual=0.0, area_ratio=0.0, pieces_off_manual=0,
+                   lake_nonice_frac=nonice_fraction(lake_gdf))
+    else:
+        outline_gdf = gpd.GeoDataFrame({"lake_name": [name], "threshold_m": [thr],
+                                        "area_m2": [float(geom.area)]}, geometry=[geom], crs=crs)
+        pieces = list(getattr(geom, "geoms", [geom]))
+        out.update(iou_manual=geom.intersection(manual).area / geom.union(manual).area,
+                   area_ratio=geom.area / manual.area,
+                   pieces_off_manual=sum(1 for p in pieces if not p.intersects(manual)),
+                   lake_nonice_frac=nonice_fraction(outline_gdf))
+        if out["iou_manual"] < SD_FLAG_MIN_IOU:
+            flags.append(f"IoU with the manual polygon {out['iou_manual']:.2f}")
+        lo, hi = SD_FLAG_AREA_RATIO
+        if not lo <= out["area_ratio"] <= hi:
+            flags.append(f"area x{out['area_ratio']:.2f} the manual polygon")
+        if out["pieces_off_manual"]:
+            flags.append(f"{out['pieces_off_manual']} piece(s) away from the manual polygon")
+    if out["ring_nonice_masked_frac"] > NONICE_FLAG_FRAC:
+        flags.append(f"{out['ring_nonice_masked_frac']:.0%} of the ring non-ice (masked)")
+    if out["lake_nonice_frac"] > NONICE_FLAG_FRAC:
+        flags.append(f"{out['lake_nonice_frac']:.0%} of the lake non-ice (GrIMP)")
+    out.update(outline_gdf=outline_gdf, threshold_m=thr, ring_gdf=ring_gdf,
+               ring_overlap=overlap, flags=flags)
+    print(f"SD lake outline ({name}): ring p{pct:g} of SD smoothed {smooth_m:g} m = {thr:.2f} m, "
+          f"{outline_gdf['area_m2'].sum() / 1e6:.2f} km2 (manual {manual.area / 1e6:.2f}), "
+          f"ring from {out['ring_source']}" + (f"; FLAGS: {'; '.join(flags)}" if flags else ""))
+    return out
+
+
+def lake_events(vol_df, intervals_df, min_dz_m=EVENT_MIN_DZ_M, min_coverage=EVENT_MIN_COVERAGE):
+    """
+    Labels each epoch interval of a lake: "drain", "fill" or "" (no event).
+
+    vol_df: contour_volumes() over the lake outline; intervals_df:
+    build_epoch_differences()["intervals_df"] (threshold_m per interval).
+    An interval is an event when |mean_dz_m| >= max(threshold_m, min_dz_m)
+    and coverage >= min_coverage. Returns vol_df with threshold_m, event and
+    from_epoch_start columns added.
+    """
+    if vol_df is None or not len(vol_df):
+        return pd.DataFrame()
+    df = vol_df.merge(intervals_df[["interval_index", "from_epoch_start", "threshold_m",
+                                    "sigma_m"]], on="interval_index", how="left")
+    limit = np.maximum(df["threshold_m"].fillna(np.inf), min_dz_m)
+    big = (df["mean_dz_m"].abs() >= limit) & (df["coverage"] >= min_coverage)
+    df["event"] = np.where(big, np.where(df["mean_dz_m"] < 0, "drain", "fill"), "")
+    return df
+
+
 def export_persistence_gpkg(gpkg_path, lake_name, tile_id, lake_gdf, search_gdf,
                             result, period_gdf, superlake_gdf,
                             sd_outline_gdf=None, ring_gdf=None,
@@ -2254,7 +2425,7 @@ def build_epoch_differences(strip_cache, strip_index, lake_gdf, ref_coords, crs,
                             n_mad=3.0, min_abs_dz_m=None, min_ring_frac=0.2,
                             min_lake_frac=0.5,
                             min_piece_m2=0.0, cleaning=None, pixel_area=None,
-                            verbose=True):
+                            verbose=True, ring_gdf=None):
     """
     Option B: outlines from differences between consecutive acquisition
     epochs, which adapts to how dense or sparse each lake's record is.
@@ -2299,6 +2470,12 @@ def build_epoch_differences(strip_cache, strip_index, lake_gdf, ref_coords, crs,
       superlake_gdf -- union of all pieces (one row)
       dz_maps      -- list of 2D dz arrays, one per interval
       ring_gdf     -- the background ring used
+
+    lake_gdf is the lake used for the coverage filter (the SD outline in the
+    batch run since Nov 2026, else the manual polygon). ring_gdf: a
+    ready-made background ring (sd_lake_outline's); None builds one from
+    lake_gdf with ring_gap_frac/ring_width_frac. Lake pixels are never
+    counted as background.
     """
     cleaning = cleaning or {"morph_closing_px": 3, "morph_opening_px": 1,
                             "min_area_m2": 400.0}
@@ -2306,11 +2483,12 @@ def build_epoch_differences(strip_cache, strip_index, lake_gdf, ref_coords, crs,
     if pixel_area is None:
         pixel_area = abs((ref_coords[0][1] - ref_coords[0][0]) *
                          (ref_coords[1][1] - ref_coords[1][0]))
-    ring_gdf = build_background_ring(lake_gdf, ring_gap_frac, ring_width_frac, tile_crs=crs)
-    ring = _ring_mask(ring_gdf, ref_coords, shape)
-    n_ring = int(ring.sum())
+    if ring_gdf is None:
+        ring_gdf = build_background_ring(lake_gdf, ring_gap_frac, ring_width_frac, tile_crs=crs)
     lake_mask = _ring_mask(lake_gdf.to_crs(crs), ref_coords, shape)
     n_lake = int(lake_mask.sum())
+    ring = _ring_mask(ring_gdf.to_crs(crs), ref_coords, shape) & ~lake_mask
+    n_ring = int(ring.sum())
 
     # 1. per-strip offset removal
     path_date = {p: d for d, paths in strip_index.items() for p in paths}
@@ -2731,7 +2909,7 @@ def add_d_over_h(row, ice_thickness_m):
 
 def plot_lake_vs_background(ts_df, lake_name=None, output_path=None,
                             ring_desc="ring 0.5-1.5 r outside the manual polygon",
-                            errorbars=True):
+                            errorbars=True, lake_desc="manual polygon"):
     """
     Absolute elevation of the lake (mean over the polygon) and of the
     background ring, per strip, in one plot -- no trend line, no outlier
@@ -2748,7 +2926,7 @@ def plot_lake_vs_background(ts_df, lake_name=None, output_path=None,
     fig, ax = plt.subplots(figsize=(14, 7))
     for col, std, label, color in (
             ("buffer_mean", "buffer_std", f"Background ({ring_desc})", "grey"),
-            ("lake_mean", "lake_std", "Lake (manual polygon mean)", "#e8432a")):
+            ("lake_mean", "lake_std", f"Lake ({lake_desc} mean)", "#e8432a")):
         ax.plot(df["date"], df[col], "-", color=color, lw=2, zorder=2)
         if errorbars and std in df:
             ax.errorbar(df["date"], df[col], yerr=df[std], fmt="o", ms=8, color=color,

@@ -3,6 +3,13 @@ All lakes, as one long run: for every lake polygon in the candidates file,
 the time series, outlines, epoch differences, contour comparison, ice
 thickness and QC table, written to OUTPUT_DIR/volume/persistence_<YYYYMMDD_HHMM>/.
 
+The lake is the SD outline (sd_lake_outline: ring p99 of the SD map smoothed
+20 m; decided 16 Nov 2026, notes/HUB.md section 3) for the time series
+(timeseries_sd_<lake>), the epoch differences, the volumes and the events
+(lake_intervals.csv). A lake with no SD outline falls back to the manual
+polygon, flagged. The manual-polygon series is still written for comparison
+(timeseries_manual_<lake>).
+
 The functions live in lake_volume.py (repo root); notebooks/03_volume.ipynb
 runs the same steps for one lake. Run this as a systemd user service (see
 CLAUDE.md); VOLUME_LAKES="Candidate #8;Flade Isblink" runs a subset.
@@ -45,7 +52,6 @@ if __name__ == "__main__":
     SUPERLAKE_MIN_FRAC = 0.10  # min outline piece = 10% of the manual polygon area
     RING_GAP_FRAC = 0.5        # background ring starts 0.5 r outside the manual polygon
     RING_WIDTH_FRAC = 1.0      # ... and is 1 r wide (r = equivalent-circle radius)
-    SD_MIN_THRESHOLD_M = None  # floor for the SD-outline threshold (m); None = ring-based only
     EPOCH_DAYS = 30            # strips within 30 days of an epoch's first strip form one epoch
     EPOCH_MIN_ABS_DZ_M = None  # floor for the epoch-difference threshold (m)
     SD_FIXED_THRESHOLDS_M = (2.0, 3.0, 5.0)  # extra SD contours compared per lake
@@ -65,6 +71,7 @@ if __name__ == "__main__":
     gpkg_path = os.path.join(run_dir, "persistence_outlines.gpkg")
     qc_path = os.path.join(run_dir, "persistence_qc.csv")
     for old in (gpkg_path, os.path.join(run_dir, "coverage_strips.csv"),
+                os.path.join(run_dir, "lake_intervals.csv"),
                 os.path.join(run_dir, "coverage_gaps.csv"),
                 os.path.join(run_dir, "epochs.csv"), os.path.join(run_dir, "epoch_intervals.csv"),
                 os.path.join(run_dir, "contour_volumes.csv"),
@@ -132,9 +139,6 @@ if __name__ == "__main__":
                     ts_df, lake_name=f"{lakename} (manual polygon)", remove_outliers=False,
                     site_coords_4326=(lon, lat),
                     output_path=os.path.join(run_dir, f"timeseries_manual_{lakename}.png"))
-                plot_lake_vs_background(
-                    ts_df, lake_name=lakename,
-                    output_path=os.path.join(run_dir, f"lake_vs_background_{lakename}.png"))
             except Exception as e:
                 print(f"WARNING: time-series plot failed for {lakename}: {e}")
             try:
@@ -191,22 +195,47 @@ if __name__ == "__main__":
             min_piece_m2 = SUPERLAKE_MIN_FRAC * float(lake_gdf.geometry.area.iloc[0])
             period_gdf, superlake_gdf = persistence_outlines(
                 result, search_gdf.crs, superlake_min_area_m2=min_piece_m2)
+            # The lake: the SD outline (ring p99, 20 m), with the ring check;
+            # the manual polygon only if there is no SD outline (flagged)
             try:
-                sd_gdf, sd_thr, ring_gdf, sd_sens = sd_outline(
-                    result, lake_gdf, min_area_m2=min_piece_m2,
-                    ring_gap_frac=RING_GAP_FRAC, ring_width_frac=RING_WIDTH_FRAC,
-                    min_threshold_m=SD_MIN_THRESHOLD_M)
-                print(f"SD outline: threshold {sd_thr:.2f} m, {len(sd_gdf)} piece(s)")
+                sd = sd_lake_outline(result, lake_gdf, min_area_m2=min_piece_m2,
+                                     ring_gap_frac=RING_GAP_FRAC, ring_width_frac=RING_WIDTH_FRAC)
+                sd_gdf, sd_thr, ring_gdf = sd["outline_gdf"], sd["threshold_m"], sd["ring_gdf"]
+                sd_flags = list(sd["flags"])
             except Exception as e:
                 print(f"WARNING: SD outline failed for {lakename}: {e}")
-                sd_gdf, sd_thr, ring_gdf, sd_sens = None, None, None, None
+                sd, sd_gdf, sd_thr = {}, None, None
+                ring_gdf = build_background_ring(lake_gdf, RING_GAP_FRAC, RING_WIDTH_FRAC)
+                sd_flags = [f"SD outline failed: {e}"]
+            if sd_gdf is not None and len(sd_gdf):
+                lake_used = sd_gdf.assign(lake_name=lakename)
+                lake_source = f"SD outline (ring p{SD_OUTLINE_PCT:g}, {SD_OUTLINE_SMOOTH_M:g} m)"
+            else:
+                lake_used = lake_gdf.to_crs(search_gdf.crs)
+                lake_source = "manual polygon (no SD outline)"
+            print(f"lake used: {lake_source}")
+            # Time series over the lake used, against the same ring (lake cut out)
+            ts_lake = None
+            try:
+                ts_lake = build_buffer_corrected_timeseries(
+                    strip_index, lake_used, tile_id, ring_gdf=ring_gdf)
+                ts_lake.to_csv(os.path.join(run_dir, f"timeseries_sd_{lakename}.csv"), index=False)
+                plot_polygon_timeseries(
+                    ts_lake, lake_name=f"{lakename} ({lake_source})", remove_outliers=False,
+                    site_coords_4326=(lon, lat),
+                    output_path=os.path.join(run_dir, f"timeseries_sd_{lakename}.png"))
+                plot_lake_vs_background(
+                    ts_lake, lake_name=lakename, lake_desc=lake_source,
+                    ring_desc=f"ring 0.5-1.5 r outside the {sd.get('ring_source', 'manual')} outline",
+                    output_path=os.path.join(run_dir, f"lake_vs_background_{lakename}.png"))
+            except Exception as e:
+                print(f"WARNING: SD-outline time series failed for {lakename}: {e}")
             # Option B: outlines from differences between consecutive epochs
             epoch_res = None
             try:
                 epoch_res = build_epoch_differences(
-                    result["strip_cache"], strip_index, lake_gdf, result["ref_coords"],
-                    search_gdf.crs, epoch_days=EPOCH_DAYS,
-                    ring_gap_frac=RING_GAP_FRAC, ring_width_frac=RING_WIDTH_FRAC,
+                    result["strip_cache"], strip_index, lake_used, result["ref_coords"],
+                    search_gdf.crs, epoch_days=EPOCH_DAYS, ring_gdf=ring_gdf,
                     min_abs_dz_m=EPOCH_MIN_ABS_DZ_M, min_piece_m2=min_piece_m2,
                     cleaning=result["cleaning"])
                 ep = epoch_res["epochs_df"].assign(lake_name=lakename)
@@ -216,12 +245,29 @@ if __name__ == "__main__":
                     df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
             except Exception as e:
                 print(f"WARNING: epoch differences failed for {lakename}: {e}")
+            # Volume change and events per interval over the lake used
+            lake_iv = pd.DataFrame()
+            if epoch_res is not None:
+                try:
+                    lake_iv = lake_events(contour_volumes(epoch_res, lake_used, result["ref_coords"]),
+                                          epoch_res["intervals_df"])
+                    if len(lake_iv):
+                        path = os.path.join(run_dir, "lake_intervals.csv")
+                        lake_iv.assign(lake_name=lakename, tile_id=tile_id, lake_used=lake_source,
+                                       stack=subfolder).to_csv(
+                            path, mode="a", header=not os.path.exists(path), index=False)
+                        ev = lake_iv[lake_iv["event"] != ""]
+                        print(f"events over the lake used:\n"
+                              f"{ev[['from_epoch_end', 'to_epoch_start', 'event', 'mean_dz_m', 'volume_m3', 'coverage']].to_string(index=False) if len(ev) else 'none'}")
+                except Exception as e:
+                    print(f"WARNING: lake volumes/events failed for {lakename}: {e}")
             # Compare contours: manual polygon and SD outlines (ring-based and
             # fixed thresholds) -- time series, volumes, one GeoPackage each
             try:
-                contours = {"manual": lake_gdf.to_crs(search_gdf.crs)}
+                contours = {}
                 if sd_gdf is not None and len(sd_gdf):
-                    contours[f"SD ring-based ({sd_thr:.2f} m)"] = sd_gdf
+                    contours[f"SD outline, ring p{SD_OUTLINE_PCT:g} ({sd_thr:.2f} m)"] = sd_gdf
+                contours["manual"] = lake_gdf.to_crs(search_gdf.crs)
                 for thr in SD_FIXED_THRESHOLDS_M:
                     g_thr, _, _, _ = sd_outline(result, lake_gdf, min_area_m2=min_piece_m2,
                                                 ring_gap_frac=RING_GAP_FRAC,
@@ -234,7 +280,7 @@ if __name__ == "__main__":
                     _append_gpkg_layer(os.path.join(run_dir, f"contours_sd_{thr:g}m.gpkg"),
                                        "sd_outline", g_out)
                 if sd_gdf is not None and len(sd_gdf):
-                    _append_gpkg_layer(os.path.join(run_dir, "contours_sd_ring.gpkg"), "sd_outline",
+                    _append_gpkg_layer(os.path.join(run_dir, "sd_lake_outlines.gpkg"), "sd_outline",
                                        sd_gdf.assign(lake_name=lakename, tile_id=tile_id,
                                                      sd_threshold_m=sd_thr))
                 ts_by, vol_by, rows = {}, {}, []
@@ -275,27 +321,37 @@ if __name__ == "__main__":
                 print(f"WARNING: ice thickness failed for {lakename}: {e}")
                 ice = {"ice_thickness_m": np.nan, "ice_thickness_centroid_m": np.nan,
                        "bed_error_m": np.nan}
-            # Non-ice ground (GrIMP): masked out of the background ring, flagged in the lake
-            ring_masked = build_background_ring(
-                lake_gdf, RING_GAP_FRAC, RING_WIDTH_FRAC).attrs["nonice_masked_frac"]
-            lake_nonice = nonice_fraction(lake_gdf)
-            nonice_flags = "; ".join(
-                f for f, bad in ((f"{ring_masked:.0%} of the ring non-ice (masked)",
-                                  ring_masked > NONICE_FLAG_FRAC),
-                                 (f"{lake_nonice:.0%} of the lake non-ice (GrIMP)",
-                                  lake_nonice > NONICE_FLAG_FRAC)) if bad)
+            # Non-ice ground (GrIMP): masked out of the background ring, flagged
+            # in the lake; the SD-outline flags (sd_lake_outline) include both
+            ring_masked = ring_gdf.attrs.get("nonice_masked_frac", np.nan)
+            lake_nonice = nonice_fraction(lake_used)
+            if not sd:  # no SD-outline check ran: flag non-ice here
+                sd_flags += [f for f, bad in (
+                    (f"{ring_masked:.0%} of the ring non-ice (masked)", ring_masked > NONICE_FLAG_FRAC),
+                    (f"{lake_nonice:.0%} of the lake non-ice (GrIMP)", lake_nonice > NONICE_FLAG_FRAC)) if bad]
+            if "cs2fb20m" not in subfolder:
+                sd_flags.append("old-chain or uncoregistered stack (provisional)")
+            ev = lake_iv[lake_iv["event"] != ""] if len(lake_iv) else lake_iv
             qc_rows.append({"lake_name": lakename, "tile_id": tile_id, "status": "ok",
-                            "stack": subfolder,
+                            "stack": subfolder, "lake_used": lake_source,
+                            "flags": "; ".join(sd_flags),
+                            "sd_rule": f"ring p{SD_OUTLINE_PCT:g} of SD smoothed {SD_OUTLINE_SMOOTH_M:g} m",
+                            "sd_ring_source": sd.get("ring_source"),
+                            "sd_ring_overlap_first": sd.get("ring_overlap_first"),
                             "ring_nonice_masked_frac": round(ring_masked, 3),
                             "lake_nonice_frac": round(lake_nonice, 3),
-                            "nonice_flags": nonice_flags,
+                            "n_strips_lake_series": len(ts_lake) if ts_lake is not None else 0,
+                            "n_drain_events": int((ev["event"] == "drain").sum()) if len(ev) else 0,
+                            "n_fill_events": int((ev["event"] == "fill").sum()) if len(ev) else 0,
+                            "largest_drain_m3": (float(ev.loc[ev["event"] == "drain", "volume_m3"].min())
+                                                 if len(ev) and (ev["event"] == "drain").any() else np.nan),
                             "ice_thickness_centroid_m": ice["ice_thickness_centroid_m"],
                             "bed_error_m": ice["bed_error_m"],
                             **persistence_qc(result, lake_gdf, search_gdf,
                                              superlake_gdf=superlake_gdf,
                                              sd_outline_gdf=sd_gdf,
                                              sd_threshold_m=sd_thr,
-                                             sd_sensitivity_df=sd_sens,
+                                             sd_sensitivity_df=None,
                                              epoch_res=epoch_res)})
             qc_rows[-1] = add_d_over_h(qc_rows[-1], ice["ice_thickness_m"])
             pd.DataFrame(qc_rows).to_csv(qc_path, index=False)
@@ -309,7 +365,7 @@ if __name__ == "__main__":
                                          epoch_superlake_gdf=(epoch_res["superlake_gdf"]
                                                               if epoch_res else None))
             if epoch_res is not None:
-                plot_epoch_differences(epoch_res, lake_gdf, search_gdf, result["ref_coords"],
+                plot_epoch_differences(epoch_res, lake_used, search_gdf, result["ref_coords"],
                                        lake_name=lakename, output_dir=run_dir)
             del result, period_gdf, superlake_gdf, epoch_res
             gc.collect()
