@@ -2633,7 +2633,8 @@ def batch_process_elevation_histories_gz(
 ):
     """Track elevation values at a point across multiple DEMs from compressed files.
     
-    Reads elevations directly from the strip .tar.gz files, in memory.
+    Reads raw strips: an unpacked '_dem.tif' with its bitmask when the archive
+    has one (windowed read), otherwise the strip .tar.gz, in memory.
     
     Parameters
     ----------
