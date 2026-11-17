@@ -185,8 +185,9 @@ def find_strip_file(archdir, geocell, strip, coreg_mode='none'):
         ('SETSM_s2s041_WV01_20150701_..._2m_lsf_seg1'). An item id pins the
         segment; a bare pairname takes the lowest segment available.
     coreg_mode : str
-        'none'  -> the strip '.tar.gz' (read in memory by open_dem), falling
-                   back to an unpacked '_dem.tif'
+        'none'  -> an unpacked '_dem.tif' with its '_bitmask.tif' beside it
+                   (fast windowed reads), else the strip '.tar.gz' (read in
+                   memory by open_dem)
         'altim' / 'mosaic' -> the coregistered GeoTIFF whose suffix exactly
                    matches coreg_suffix(coreg_mode). The doubled-prefix
                    variant ('_cs2_v_cs2_v_...', an upstream naming bug) is
@@ -204,17 +205,25 @@ def find_strip_file(archdir, geocell, strip, coreg_mode='none'):
     head = rf"SETSM_s2s041_{re.escape(pair)}_2m_(?:lsf_)?(?P<seg>{seg_rx})"
 
     if coreg_mode == 'none':
-        tails = [r"\.tar\.gz", r"_dem\.tif"]
+        # (tail, needs its '_bitmask.tif' alongside). An unpacked strip is read
+        # by window (fast); a tarball has to be gunzipped whole (seconds to
+        # minutes). Unpacked first, but only with its bitmask (some geocells
+        # were unpacked without one), else the tarball. A bare unpacked DEM
+        # (no bitmask, no tarball) is not used.
+        tails = [(r"_dem\.tif", True), (r"\.tar\.gz", False)]
     else:
         suffix = coreg_suffix(coreg_mode)
         doubled = f"_{COREG_PARAMS[coreg_mode]['reference_data']}_v{suffix}"
-        tails = [re.escape(f"_dem{suffix}_coregistered.tif"),
-                 re.escape(f"_dem{doubled}_coregistered.tif")]
+        tails = [(re.escape(f"_dem{suffix}_coregistered.tif"), False),
+                 (re.escape(f"_dem{doubled}_coregistered.tif"), False)]
 
     names = _list_geocell(archdir, geocell)
-    for tail in tails:
+    name_set = set(names)
+    for tail, needs_bitmask in tails:
         rx = re.compile(head + tail + "$")
-        hits = sorted(((int(m['seg'][3:]), n) for n in names if (m := rx.match(n))))
+        hits = sorted(((int(m['seg'][3:]), n) for n in names if (m := rx.match(n))
+                       and (not needs_bitmask
+                            or n[:-len('_dem.tif')] + '_bitmask.tif' in name_set)))
         if hits:
             if seg is None and len(hits) > 1:
                 print(f"  ⚠ {pair}: {len(hits)} segments available, using seg{hits[0][0]} "
