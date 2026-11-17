@@ -11,8 +11,15 @@ polygon, flagged. The manual-polygon series is still written for comparison
 (timeseries_manual_<lake>).
 
 The functions live in lake_volume.py (repo root); notebooks/03_volume.ipynb
-runs the same steps for one lake. Run this as a systemd user service (see
-CLAUDE.md); VOLUME_LAKES="Candidate #8;Flade Isblink" runs a subset.
+runs the same steps for one lake. VOLUME_LAKES="Candidate #8;Flade Isblink"
+runs a subset.
+
+Long runs: start it as a systemd user service, which survives the editor or
+SSH session closing (nohup and tmux runs were killed when it did), and keep
+a login session open on the VM:
+    systemd-run --user --unit=volume-run --collect --working-directory=<repo>/notebooks \\
+        --setenv=MPLBACKEND=Agg /bin/sh -c "<env python> -u 03_volume_batch.py > <log> 2>&1"
+    systemctl --user status volume-run
 """
 import os
 import sys
