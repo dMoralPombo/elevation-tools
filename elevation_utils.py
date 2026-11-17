@@ -527,7 +527,9 @@ def transect_from_mosaic(coords_4326, num_samples=100):
     #     raise ValueError(f"No mosaic found containing point_B {coords[1]}")
 
     if containing_polygons_A.empty and containing_polygons_B.empty:
-        raise ValueError(f"No mosaic found containing either point_A {coords_4326[0]} or point_B {coords_4326[1]}")
+        print(f"⚠ No mosaic tile in the index contains either end of the transect; "
+              f"continuing without the mosaic profile.")
+        return None, None, None, None, None, None, None
     if containing_polygons_A.empty:
         containing_polygons_A = containing_polygons_B
     if containing_polygons_B.empty:
@@ -543,8 +545,11 @@ def transect_from_mosaic(coords_4326, num_samples=100):
 
         # Construct the expected mosaic file path
         mosaic_dem = f"{MOSAIC_DIR}{supertile}/{tile_id}_dem.tif"
-        if not mosaic_dem:
-            raise FileNotFoundError(f"No mosaic file found for coordinates {coords_4326}.")
+        if not os.path.exists(mosaic_dem):
+            # e.g. Svalbard: in the index, but the tile was never downloaded
+            print(f"⚠ Mosaic tile {tile_A} is not in the archive ({mosaic_dem}); "
+                  f"continuing without the mosaic profile.")
+            return None, None, None, None, None, None, None
 
         rasterpath = mosaic_dem
         print(f"Using mosaic file: {rasterpath}")
