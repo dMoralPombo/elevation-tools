@@ -215,7 +215,7 @@ def main():
         year_axis(ax, t0, t1)
         ps.figure_title(fig, lake)
         bottom_legend(fig)
-        fig.text(0.01, -0.12, note_text(a.final), fontsize=ps.SMALL_PT - 1, color=ps.C_OTHER, va="top")
+        fig.text(0.01, -0.22, note_text(a.final), fontsize=ps.SMALL_PT - 1, color=ps.C_OTHER, va="top")
         ps.save(fig, os.path.join(out_dir, f"fig4_lake_{slug(lake)}"))
         plt.close(fig)
         group = next(i for i, g in enumerate(groups) if lake in g)
@@ -246,7 +246,7 @@ def main():
         bottom_legend(fig)
         fig.supylabel("dh (m)", fontsize=ps.LABEL_PT, x=0.04)
         ps.figure_title(fig, f"{', '.join(lakes)} (within {a.group_km:g} km)")
-        fig.text(0.01, -0.03, note_text(a.final), fontsize=ps.SMALL_PT - 1, color=ps.C_OTHER, va="top")
+        fig.text(0.01, -0.06, note_text(a.final), fontsize=ps.SMALL_PT - 1, color=ps.C_OTHER, va="top")
         ps.save(fig, os.path.join(out_dir, f"fig4_group_{gi}"))
         plt.close(fig)
 
