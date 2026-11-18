@@ -9,6 +9,7 @@ from datetime import datetime
 # from typing import List, Tuple, Optional, Dict, Any
 # import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
@@ -30,7 +31,7 @@ from scipy.ndimage import label as nd_label
 # Import utilities
 from elevation_utils import (
     wgs84_to_3413, get_elevation_window, extract_elevation_profile,
-    transect_from_mosaic, find_strip_file, open_dem
+    transect_from_mosaic, find_strip_file, open_dem, mosaic_dem_path
 )
 from config import (
     OUTPUT_DIR, DEFAULT_NUM_SAMPLES, DEFAULT_WINDOW_SIZE,
@@ -697,7 +698,8 @@ def plot_elevation_history(history, output_path=None, coreg_mode='none', lake_na
         p = np.poly1d(z)
         slope = z[0] * 365.25
         
-        trend_color = 'red' if slope < -0.5 else 'green' if slope > 0.5 else 'orange'
+        # Red = lowering (drainage), blue = rising (filling), as in all plots
+        trend_color = 'red' if slope < -0.5 else 'blue' if slope > 0.5 else 'orange'
         ax.plot(valid_pd['date'], p(dates_num), '--', color=trend_color,
                linewidth=1.5, alpha=0.6, label=f'Trend: {slope:.2f} m/yr')
     
@@ -750,6 +752,71 @@ def plot_elevation_history(history, output_path=None, coreg_mode='none', lake_na
     return output_path
 
 
+# Map panels of plot_combined_profiles: a source must cover at least this
+# fraction of the map area with valid pixels, else the next one is tried
+MAP_MIN_VALID_FRAC = 0.8
+MAP_MAX_STRIPS = 10   # strips tried at most (each raw strip read takes seconds)
+
+
+def _read_map_window(path, bounds, raw_strip=True):
+    """Read `bounds` (left, bottom, right, top; EPSG:3413) from a DEM.
+
+    Returns (masked array, window bounds, pixel size). Raw strips go through
+    open_dem (bitmask applied); the mosaic is opened directly. Areas outside
+    the raster come back masked (boundless read).
+    """
+    opener = open_dem(path) if raw_strip else rio.open(path)
+    with opener as src:
+        window = src.window(*bounds)
+        window_bounds = rio.windows.bounds(window, src.transform)
+        data = src.read(1, window=window, boundless=True)
+        nodata, res = src.nodata, src.res
+    data = np.ma.masked_invalid(data.astype("float32"))
+    data = np.ma.masked_equal(data, nodata if nodata is not None else -9999)
+    return data, window_bounds, res
+
+
+def _pick_map_source(all_profiles, bounds):
+    """Choose the DEM drawn in the map panels.
+
+    Order: the newest strip (profiles[0]); if it covers less than
+    MAP_MIN_VALID_FRAC of the map area, the 2 m mosaic (if in the archive);
+    then the next strips, up to MAP_MAX_STRIPS. The first source above the
+    threshold wins; if none is, the most complete one seen.
+    Returns (masked array, window bounds, pixel size, label for titles).
+    """
+    (lon0, lat0), (lon1, lat1) = all_profiles["transect_coords"]
+
+    def candidates():
+        profiles = all_profiles["profiles"]
+        yield (profiles[0]["metadata"]["path"], True,
+               extract_date_label(profiles[0]["metadata"]["dem_name"]))
+        mosaic = mosaic_dem_path((lon0 + lon1) / 2, (lat0 + lat1) / 2)
+        if mosaic:
+            yield mosaic, False, "ArcticDEM mosaic"
+        for p in profiles[1:MAP_MAX_STRIPS]:
+            yield p["metadata"]["path"], True, extract_date_label(p["metadata"]["dem_name"])
+
+    best = None
+    for path, raw, label in candidates():
+        try:
+            data, wb, res = _read_map_window(path, bounds, raw_strip=raw)
+        except Exception as e:
+            print(f"  map: {label} unreadable ({e}); trying the next source")
+            continue
+        frac = data.count() / data.size
+        if best is None or frac > best[0]:
+            best = (frac, data, wb, res, label)
+        if frac >= MAP_MIN_VALID_FRAC:
+            break
+        print(f"  map: {label} covers {frac:.0%} of the map area; trying the next source")
+    if best is None:
+        raise ValueError("No readable DEM for the map panels")
+    frac, data, wb, res, label = best
+    print(f"Map panels: {label} ({frac:.0%} of the map area)")
+    return data, wb, res, label
+
+
 def plot_combined_profiles(all_profiles, coreg_mode='none', cmap='terrain', lake_name=None, margin_km=2):
     """Plot elevation profiles from multiple DEMs with reference map.
     
@@ -774,154 +841,126 @@ def plot_combined_profiles(all_profiles, coreg_mode='none', cmap='terrain', lake
     if not all_profiles["profiles"]:
         raise ValueError("No profile data available for plotting")
 
-    # Use first DEM for the map plot
-    selected_profile = all_profiles["profiles"][0]
-    raster_metadata = selected_profile["metadata"]
-    x0, y0, x1, y1 = selected_profile["coords"]
+    # Transect end points (EPSG:3413) and the map area around them
+    x0, y0, x1, y1 = all_profiles["profiles"][0]["coords"]
+    margin = margin_km * 1000  # meters
+    map_bounds = (min(x0, x1) - margin, min(y0, y1) - margin,
+                  max(x0, x1) + margin, max(y0, y1) + margin)
 
-    # Create figure with 3 subplots: 2 left (stacked), 1 right
-    fig = plt.figure(figsize=(16, 9))
-    gs = fig.add_gridspec(2, 2, width_ratios=[1, 2], height_ratios=[1, 1], 
-                         wspace=0.32, hspace=0.22)
+    # Map source: the newest strip if it covers the map area well enough,
+    # else the mosaic, else the next most complete strip
+    raster_data_masked, window_bounds, map_res, title_date = _pick_map_source(
+        all_profiles, map_bounds)
 
-    # Coregistered GeoTIFF, or strip tarball read in memory
-    demfile = raster_metadata["path"]
+    # Create figure with 3 subplots: 2 left (stacked), 1 right, plus a thin
+    # column for the elevation colorbar between them. Generous gaps: each map
+    # has secondary (lon/lat) axes on top and right.
+    fig = plt.figure(figsize=(15, 10))
+    gs = fig.add_gridspec(2, 3, width_ratios=[1, 0.04, 1.8], height_ratios=[1, 1],
+                          wspace=0.45, hspace=0.5)
 
-    with open_dem(demfile) as src:
-        # Calculate the bounding box with margin
-        margin = margin_km * 1000  # meters
-        min_x, max_x = min(x0, x1) - margin, max(x0, x1) + margin
-        min_y, max_y = min(y0, y1) - margin, max(y0, y1) + margin
+    # Create hillshade
+    ls = LightSource(azdeg=315, altdeg=45)
+    hillshade = ls.hillshade(raster_data_masked, vert_exag=2, dx=map_res[0], dy=map_res[1])
 
-        # Calculate window to read
-        window = src.window(min_x, min_y, max_x, max_y)
-        window_bounds = rio.windows.bounds(window, src.transform)
+    # TOP LEFT - DEM with elevation colormap
+    ax1 = fig.add_subplot(gs[0, 0])
+    img1 = ax1.imshow(raster_data_masked, cmap=cmap, 
+                     extent=(window_bounds[0], window_bounds[2], 
+                            window_bounds[1], window_bounds[3]),
+                     origin="upper", aspect=1.2, interpolation="none", rasterized=True)
 
-        # Read raster data
-        raster_data = src.read(1, window=window)
-        # Handle nodata values properly
-        if src.nodata is not None:
-            raster_data_masked = np.ma.masked_equal(raster_data, src.nodata)
-        else:
-            # Try common nodata values
-            for nodata_candidate in [-9999, -32768, 0]:
-                if np.any(raster_data == nodata_candidate):
-                    raster_data_masked = np.ma.masked_equal(raster_data, nodata_candidate)
-                    break
-            else:
-                raster_data_masked = np.ma.masked_invalid(raster_data)
+    # Plot transect line and markers
+    ax1.plot([x0, x1], [y0, y1], "k--", linewidth=1.5)
+    ax1.plot(x0, y0, "ro", markersize=8, markeredgewidth=1.5, 
+            markeredgecolor="white", label="Start (A)")
+    ax1.plot(x1, y1, "bo", markersize=8, markeredgewidth=1.5, 
+            markeredgecolor="white", label="End (B)")
 
-        # Create hillshade
-        ls = LightSource(azdeg=315, altdeg=45)
-        hillshade = ls.hillshade(raster_data_masked, vert_exag=2, dx=src.res[0], dy=src.res[1])
+    # Add scale bar
+    scale_length = 3000  # 3 km in meters
+    x_pos = 0.1 * (window_bounds[2] - window_bounds[0]) + window_bounds[0]
+    y_pos = 0.05 * (window_bounds[3] - window_bounds[1]) + window_bounds[1]
+    ax1.plot([x_pos, x_pos + scale_length], [y_pos, y_pos], color="black", 
+            linewidth=3, solid_capstyle="butt")
+    ax1.text(x_pos + scale_length / 2, y_pos + 0.016 * (window_bounds[3] - window_bounds[1]), 
+            "3 km", ha="center", va="bottom", fontsize=10, color="black")
 
-        # TOP LEFT - DEM with elevation colormap
-        ax1 = fig.add_subplot(gs[0, 0])
-        img1 = ax1.imshow(raster_data_masked, cmap=cmap, 
-                         extent=(window_bounds[0], window_bounds[2], 
-                                window_bounds[1], window_bounds[3]),
-                         origin="upper", aspect=1.2, interpolation="none", rasterized=True)
+    # Format top left plot
 
-        # Plot transect line and markers
-        ax1.plot([x0, x1], [y0, y1], "k--", linewidth=1.5)
-        ax1.plot(x0, y0, "ro", markersize=8, markeredgewidth=1.5, 
-                markeredgecolor="white", label="Start (A)")
-        ax1.plot(x1, y1, "bo", markersize=8, markeredgewidth=1.5, 
-                markeredgecolor="white", label="End (B)")
+    ax1.set_title(f"Reference DEM Elevation - {title_date}", pad=40, fontsize=11)
+    ax1.legend(fontsize=8, loc="upper right")
+    # Colorbar in its own grid column, so the map keeps the same size as the
+    # hillshade below and the bar never runs into the profile panel
+    cax1 = fig.add_subplot(gs[0, 1])
+    cbar1 = fig.colorbar(img1, cax=cax1, orientation="vertical")
+    cbar1.set_label("Elevation (m)", rotation=270, labelpad=13, fontsize=10)
 
-        # Add scale bar
-        scale_length = 3000  # 3 km in meters
-        x_pos = 0.1 * (window_bounds[2] - window_bounds[0]) + window_bounds[0]
-        y_pos = 0.05 * (window_bounds[3] - window_bounds[1]) + window_bounds[1]
-        ax1.plot([x_pos, x_pos + scale_length], [y_pos, y_pos], color="black", 
-                linewidth=3, solid_capstyle="butt")
-        ax1.text(x_pos + scale_length / 2, y_pos + 0.016 * (window_bounds[3] - window_bounds[1]), 
-                "3 km", ha="center", va="bottom", fontsize=10, color="black")
+    # Add primary axes for EPSG:3413 coordinates
+    # Three ticks per axis: 7-digit EPSG:3413 labels crowd otherwise
+    x_m_ticks = np.linspace(window_bounds[0], window_bounds[2], 5)[1:-1]
+    y_m_ticks = np.linspace(window_bounds[1], window_bounds[3], 5)[1:-1]
+    ax1.set_xticks(x_m_ticks)
+    ax1.set_xticklabels([f"{int(x_i)}" for x_i in x_m_ticks])
+    ax1.set_xlabel("X (m) - EPSG 3413", labelpad=8)        
+    ax1.set_yticks(y_m_ticks)
+    ax1.set_yticklabels([f"{int(y_i)}" for y_i in y_m_ticks])
+    ax1.set_ylabel("Y (m) - EPSG 3413", labelpad=10, rotation=90)
+    ax1.tick_params(labelsize=8)
+    
+    # Add secondary axes for EPSG:4326 coordinates
+    x_ticks, y_ticks, lon_ticks, lat_ticks = _secondary_axis_labels(
+        window_bounds[0], window_bounds[2], window_bounds[1], window_bounds[3],
+        n_ticks=3,
+    )
+    _add_secondary_axes(ax1, x_ticks, y_ticks, lon_ticks, lat_ticks)
 
-        # Format top left plot
-        refdemname = raster_metadata["dem_name"]
-        dem_parts = refdemname.split("_")
-        if len(dem_parts) > 1 and len(dem_parts[1]) >= 6:
-            date_str = dem_parts[1]
-            year, month = date_str[:4], date_str[4:6]
-            month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", 
-                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-            try:
-                title_date = f"{month_names[int(month)]} {year}"
-            except (ValueError, IndexError):
-                title_date = refdemname
-        else:
-            title_date = refdemname
+    # BOTTOM LEFT - Hillshade
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.imshow(hillshade, cmap="gray", 
+              extent=(window_bounds[0], window_bounds[2], 
+                     window_bounds[1], window_bounds[3]),
+              origin="upper", aspect=1.2, interpolation="none", rasterized=True)
 
-        ax1.set_title(f"Reference DEM Elevation - {title_date}", pad=13, fontsize=11)
-        ax1.legend(fontsize=8, loc="upper right")
-        cbar1 = fig.colorbar(img1, ax=ax1, orientation="vertical", pad=0.2, 
-                            fraction=0.025, aspect=25)
-        cbar1.set_label("Elevation (m)", rotation=270, labelpad=13, fontsize=10)
+    # Plot transect line and markers
+    ax2.plot([x0, x1], [y0, y1], "k--", linewidth=1.5)
+    ax2.plot(x0, y0, "ro", markersize=8, markeredgewidth=1.5, 
+            markeredgecolor="white", label="Start (A)")
+    ax2.plot(x1, y1, "bo", markersize=8, markeredgewidth=1.5, 
+            markeredgecolor="white", label="End (B)")
 
-        # Add primary axes for EPSG:3413 coordinates
-        x_m_ticks = np.linspace(window_bounds[0], window_bounds[2], 6)[1:-1]
-        y_m_ticks = np.linspace(window_bounds[1], window_bounds[3], 6)[1:-1]
-        ax1.set_xticks(x_m_ticks)
-        ax1.set_xticklabels([f"{int(x_i)}" for x_i in x_m_ticks])
-        ax1.set_xlabel("X (m) - EPSG 3413", labelpad=8)        
-        ax1.set_yticks(y_m_ticks)
-        ax1.set_yticklabels([f"{int(y_i)}" for y_i in y_m_ticks])
-        ax1.set_ylabel("Y (m) - EPSG 3413", labelpad=10, rotation=90)
-        ax1.tick_params(labelsize=8)
-        
-        # Add secondary axes for EPSG:4326 coordinates
-        x_ticks, y_ticks, lon_ticks, lat_ticks = _secondary_axis_labels(
-            window_bounds[0], window_bounds[2], window_bounds[1], window_bounds[3]
-        )
-        _add_secondary_axes(ax1, x_ticks, y_ticks, lon_ticks, lat_ticks)
+    # Add scale bar
+    ax2.plot([x_pos, x_pos + scale_length], [y_pos, y_pos], color="black", 
+            linewidth=3, solid_capstyle="butt")
+    ax2.text(x_pos + scale_length / 2, y_pos + 0.016 * (window_bounds[3] - window_bounds[1]), 
+            "3 km", ha="center", va="bottom", fontsize=10, color="black")
 
-        # BOTTOM LEFT - Hillshade
-        ax2 = fig.add_subplot(gs[1, 0])
-        ax2.imshow(hillshade, cmap="gray", 
-                  extent=(window_bounds[0], window_bounds[2], 
-                         window_bounds[1], window_bounds[3]),
-                  origin="upper", aspect=1.2, interpolation="none", rasterized=True)
+    ax2.set_title(f"Hillshade - {title_date}", pad=40, fontsize=11)
+    ax2.legend(fontsize=8, loc="upper right")
+    # ax2.secondary_xaxis("top", functions=(
+    #     lambda x: transformer.transform(x, np.full_like(x, window_bounds[1]))[0], 
+    #     lambda x: x))
+    # ax2.secondary_yaxis("right", functions=(
+    #     lambda y: transformer.transform(np.full_like(y, window_bounds[0]), y)[1], 
+    #     lambda y: y))
 
-        # Plot transect line and markers
-        ax2.plot([x0, x1], [y0, y1], "k--", linewidth=1.5)
-        ax2.plot(x0, y0, "ro", markersize=8, markeredgewidth=1.5, 
-                markeredgecolor="white", label="Start (A)")
-        ax2.plot(x1, y1, "bo", markersize=8, markeredgewidth=1.5, 
-                markeredgecolor="white", label="End (B)")
+    # Add primary axes for EPSG:3413 coordinates
+    ax2.set_xticks(x_m_ticks)
+    ax2.set_xticklabels([f"{int(x_i)}" for x_i in x_m_ticks])
+    ax2.set_xlabel("X (m) - EPSG 3413", labelpad=8)        
+    ax2.set_yticks(y_m_ticks)
+    ax2.set_yticklabels([f"{int(y_i)}" for y_i in y_m_ticks])
+    ax2.set_ylabel("Y (m) - EPSG 3413", labelpad=10, rotation=90)
+    ax2.tick_params(labelsize=8)
 
-        # Add scale bar
-        ax2.plot([x_pos, x_pos + scale_length], [y_pos, y_pos], color="black", 
-                linewidth=3, solid_capstyle="butt")
-        ax2.text(x_pos + scale_length / 2, y_pos + 0.016 * (window_bounds[3] - window_bounds[1]), 
-                "3 km", ha="center", va="bottom", fontsize=10, color="black")
+    ax2.set_ylabel("Y (m) - EPSG 3413", labelpad=10, rotation=90)
+    ax2.tick_params(labelsize=8)
 
-        ax2.set_title(f"Hillshade - {title_date}", pad=10, fontsize=11)
-        ax2.legend(fontsize=8, loc="upper right")
-        # ax2.secondary_xaxis("top", functions=(
-        #     lambda x: transformer.transform(x, np.full_like(x, window_bounds[1]))[0], 
-        #     lambda x: x))
-        # ax2.secondary_yaxis("right", functions=(
-        #     lambda y: transformer.transform(np.full_like(y, window_bounds[0]), y)[1], 
-        #     lambda y: y))
-
-        # Add primary axes for EPSG:3413 coordinates
-        ax2.set_xticks(x_m_ticks)
-        ax2.set_xticklabels([f"{int(x_i)}" for x_i in x_m_ticks])
-        ax2.set_xlabel("X (m) - EPSG 3413", labelpad=8)        
-        ax2.set_yticks(y_m_ticks)
-        ax2.set_yticklabels([f"{int(y_i)}" for y_i in y_m_ticks])
-        ax2.set_ylabel("Y (m) - EPSG 3413", labelpad=10, rotation=90)
-        ax2.tick_params(labelsize=8)
-
-        ax2.set_ylabel("Y (m) - EPSG 3413", labelpad=10, rotation=90)
-        ax2.tick_params(labelsize=8)
-
-        _add_secondary_axes(ax2, x_ticks, y_ticks, lon_ticks, lat_ticks)
+    _add_secondary_axes(ax2, x_ticks, y_ticks, lon_ticks, lat_ticks)
 
 
     # RIGHT PLOT - All elevation profiles (spans both rows)
-    ax3 = fig.add_subplot(gs[:, 1])
+    ax3 = fig.add_subplot(gs[:, 2])
 
     # Define colors for profiles
     colors = plt.cm.viridis(np.linspace(0.3, 1, len(all_profiles["profiles"])))
@@ -999,17 +1038,17 @@ def plot_combined_profiles(all_profiles, coreg_mode='none', cmap='terrain', lake
     ax3.set_xlim(0, all_profiles["profiles"][0]["distance"])
 
     # Add A/B markers
-    first_profile_values = all_profiles["profiles"][0]["profile_values"]
-    ax3.annotate("A", xy=(0, first_profile_values[0]), xytext=(0.0, 1.01), 
-                textcoords="axes fraction", color="red", fontsize=13, fontweight="bold")
-    ax3.annotate("B", xy=(all_profiles["profiles"][0]["distance"], first_profile_values[-1]), 
-                xytext=(1.0, 1.01), textcoords="axes fraction", ha="right", 
-                color="blue", fontsize=13, fontweight="bold")
+    # In axes coordinates: anchoring on a profile value hid the label when
+    # that value was NaN
+    ax3.text(0.0, 1.01, "A", transform=ax3.transAxes, color="red",
+             fontsize=13, fontweight="bold")
+    ax3.text(1.0, 1.01, "B", transform=ax3.transAxes, ha="right", color="blue",
+             fontsize=13, fontweight="bold")
 
     date_start = extract_date_label(all_profiles["profiles"][-1]["metadata"]["dem_name"])
     date_end = extract_date_label(all_profiles["profiles"][0]["metadata"]["dem_name"])
     fig.suptitle(f"Elevation Profile Comparison: {date_start} - {date_end}", 
-                fontsize=15, fontweight="bold", y=0.99)
+                fontsize=15, fontweight="bold", y=1.0)
 
     # Adjust layout
     plt.subplots_adjust(left=0.06, right=0.96, bottom=0.08, top=0.94)
@@ -1040,7 +1079,7 @@ def plot_combined_profiles(all_profiles, coreg_mode='none', cmap='terrain', lake
 
 def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, lake_name=None, output_path=None):
     """Create a heatmap showing elevation changes relative to a reference DEM.
-    Red = higher than reference, Blue = lower than reference (drainage).
+    Red = lower than reference (drainage), Blue = higher (filling).
     
     Parameters
     ----------
@@ -1118,7 +1157,7 @@ def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, 
     max_abs_diff = np.nanmax(np.abs(diff_matrix))
     vlim = max(5, max_abs_diff)
     
-    im = ax1.imshow(diff_matrix, aspect='auto', cmap='RdBu_r', 
+    im = ax1.imshow(diff_matrix, aspect='auto', cmap='RdBu', 
                    extent=[0, transect_km[-1], len(dates)-0.5, -0.5],
                    vmin=-vlim, vmax=vlim, interpolation='nearest')
     
@@ -1131,7 +1170,7 @@ def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, 
         ax1.set_yticks(range(len(dates)))
         ax1.set_yticklabels(dates, fontsize=9)
 
-    title = f'Elevation Change Relative to {reference_date}\n(Red = Higher, Blue = Lower)'
+    title = f'Elevation Change Relative to {reference_date}\n(Red = Lower / drainage, Blue = Higher / filling)'
     if lake_name:
         title = f'{lake_name} - {title}'
 
@@ -1166,7 +1205,9 @@ def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, 
     mean_changes = [np.nanmean(diff) for diff in diff_matrix]
     
     for i, (year, mean_change) in enumerate(zip(years, mean_changes)):
-        color = 'red' if mean_change > 0 else 'blue' if mean_change < 0 else 'gray'
+        # Red = lowering (drainage), blue = rising (filling); changes beyond
+        # ±2 m drawn as larger, darker squares
+        color = 'red' if mean_change < 0 else 'blue' if mean_change > 0 else 'gray'
         marker = 'o'
         markersize = 6
         
@@ -1174,6 +1215,10 @@ def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, 
             marker = 's'
             markersize = 8
             color = 'darkred'
+        elif mean_change > 2:
+            marker = 's'
+            markersize = 8
+            color = 'darkblue'
         
         ax2.plot(i, mean_change, color=color, marker=marker, markersize=markersize, 
                 alpha=0.7, linestyle='none')
@@ -1738,12 +1783,15 @@ def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, 
     
 #     plt.show()
 #     return fig
-def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_path=None):
-    """Plot elevation changes relative to the oldest DEM (reference).
-    
-    Uses a divergent colormap (coolwarm) centered on the reference date,
-    with warm colors (reds/oranges) for post-reference profiles and
-    cool colors (blues) for pre-reference profiles.
+def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_path=None,
+                              reference_year=None):
+    """Plot elevation changes relative to a reference DEM (the oldest by default).
+
+    With the oldest DEM as reference (reference_year None, or a year that picks
+    the oldest), every profile is later than the reference, so lines are coloured
+    by date on a sequential colormap (plasma) with a date colorbar. With a later
+    reference, a diverging colormap (PiYG) separates older (pink) from newer
+    (green) profiles, with a three-entry colour key.
     
     Parameters    
     ----------
@@ -1755,6 +1803,8 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
         Name of the lake for plot labeling
     output_path : str, optional
         Path to save the plot
+    reference_year : int, optional
+        Use the DEM closest to this year as reference (default: the oldest)
     
     Returns
     -------
@@ -1768,8 +1818,14 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
     profiles_sorted = sorted(all_profiles["profiles"], 
                             key=lambda x: extract_date_obj(x["metadata"]["dem_name"]))
     
-    # Use the oldest as reference if no other predefined
-    reference_profile = profiles_sorted[0]
+    # Use the oldest as reference unless a reference year is given
+    if reference_year is None:
+        reference_profile = profiles_sorted[0]
+    else:
+        reference_profile = min(profiles_sorted, key=lambda p: abs(
+            extract_year(p["metadata"]["dem_name"]) - reference_year))
+    # Every other profile is newer -> sequential colours; otherwise diverging
+    sequential = reference_profile is profiles_sorted[0]
     reference_path = reference_profile["metadata"]["path"]
     reference_date = extract_date_label(reference_profile["metadata"]["dem_name"])
     ref_year = extract_year(reference_profile["metadata"]["dem_name"])
@@ -1785,10 +1841,21 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
     # Create figure with single plot
     fig, ax = plt.subplots(figsize=(14, 7))
     
-    # Use a divergent colormap: coolwarm, RdBu, or seismic
-    # coolwarm: blue (cool/old) → white (reference) → red (warm/recent)
-    # cmap = plt.cm.coolwarm
-    cmap = plt.cm.PiYG
+    def _decimal_year(p):
+        d = extract_date_obj(p["metadata"]["dem_name"])
+        return d.year + (d.timetuple().tm_yday - 1) / 365.25
+
+    if sequential:
+        # Sequential, unlike viridis in the profile comparison; the pale
+        # yellow end of plasma is cut so the newest lines stay visible
+        cmap = mcolors.LinearSegmentedColormap.from_list(
+            "plasma_trunc", plt.cm.plasma(np.linspace(0.0, 0.85, 256)))
+        others = [_decimal_year(p) for p in profiles_sorted if p is not reference_profile]
+        date_norm = mcolors.Normalize(vmin=min(others, default=0),
+                                      vmax=max(max(others, default=1), min(others, default=0) + 1e-6))
+    else:
+        # Diverging: pink (older) - white (reference) - green (newer)
+        cmap = plt.cm.PiYG
     
     # Plot difference for each profile (skip reference)
     for profile in profiles_sorted:
@@ -1808,7 +1875,9 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
             # Before reference → 0.0 to 0.5 (blues)
             # After reference → 0.5 to 1.0 (reds)
             
-            if year_range <= 1:
+            if sequential:
+                color_idx = date_norm(_decimal_year(profile))
+            elif year_range <= 1:
                 # All profiles in same year — use subtle variation
                 color_idx = 0.5
             else:
@@ -1832,7 +1901,9 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
             linewidth = 1.0 + (years_from_ref / max(year_range, 1)) * 1.0
             alpha = 0.5 + (years_from_ref / max(year_range, 1)) * 0.2
             
-            ax.plot(transect_m[valid_mask], elevation_diff, 
+            # Full arrays (NaN where either profile has no data), so gaps
+            # show as gaps rather than straight lines across them
+            ax.plot(transect_m, np.where(valid_mask, profvalues - ref_values, np.nan),
                     color=color, linewidth=linewidth, alpha=alpha, label=date_label)
     
     # Zero line (no change from reference)
@@ -1869,9 +1940,9 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
         if n_profiles > 10:
             step = max(1, n_profiles // 10)
             ax.legend(handles[::step], labels[::step], fontsize=8, loc='best',
-                    frameon=True, fancybox=True, shadow=True)
+                    frameon=True)
         else:
-            ax.legend(loc='best', fontsize=8, frameon=True, fancybox=True, shadow=True)
+            ax.legend(loc='best', fontsize=8, frameon=True)
     
     # Add A/B markers at start and end of transect
     ax.annotate('A', xy=(transect_m[0], 0), xytext=(0.0, 1.01), 
@@ -1891,30 +1962,34 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
     
     ax.set_title(title_text, fontsize=14, fontweight='bold', pad=15)
     
-    # Add color legend explaining the divergent colormap
-    from matplotlib.patches import Patch
+    # Colour key: a date colorbar (sequential) or a three-entry key (diverging)
     from matplotlib.lines import Line2D
-    
-    # Create custom legend elements for the colormap
-    legend_elements = [
-        Line2D([0], [0], color=cmap(0.15), linewidth=2, 
-               label=f'Pre-reference (older)'),
-        Line2D([0], [0], color=cmap(0.5), linewidth=2, 
-               label=f'Reference ({reference_date})'),
-        Line2D([0], [0], color=cmap(0.85), linewidth=2, 
-               label=f'Post-reference (newer)'),
-    ]
-    
-    # Add colorbar-like legend
-    legend_colors = ax.legend(handles=legend_elements, 
-                             loc='lower left', 
-                             fontsize=8,
-                             title='Color Key',
-                             title_fontsize=9,
-                             frameon=True, 
-                             fancybox=True, 
-                             shadow=True)
-    ax.add_artist(legend_colors)  # Keep both legends
+
+    if sequential:
+        sm = plt.cm.ScalarMappable(norm=date_norm, cmap=cmap)
+        cbar = fig.colorbar(sm, ax=ax, pad=0.02, fraction=0.03, aspect=30)
+        cbar.set_label(f"Acquisition date (reference {reference_date})", fontsize=10)
+        yr0, yr1 = int(np.floor(date_norm.vmin)), int(np.ceil(date_norm.vmax))
+        step = max(1, (yr1 - yr0) // 8)
+        cbar.set_ticks([y for y in range(yr0, yr1 + 1, step)
+                        if date_norm.vmin <= y <= date_norm.vmax])
+        cbar.ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}"))
+        legend_elements = None
+    else:
+        legend_elements = [
+            Line2D([0], [0], color=cmap(0.15), linewidth=2,
+                   label='Pre-reference (older)'),
+            Line2D([0], [0], color=cmap(0.5), linewidth=2,
+                   label=f'Reference ({reference_date})'),
+            Line2D([0], [0], color=cmap(0.85), linewidth=2,
+                   label='Post-reference (newer)'),
+        ]
+        # A second ax.legend() replaces the first, so re-add the date legend
+        date_legend = ax.get_legend()
+        ax.legend(handles=legend_elements, loc='lower left', fontsize=8,
+                  title='Color Key', title_fontsize=9, frameon=True)
+        if date_legend is not None:
+            ax.add_artist(date_legend)
     
     # Add annotation with statistics
     years_from_ref_list = [abs(extract_year(p["metadata"]["dem_name"]) - ref_year) 
