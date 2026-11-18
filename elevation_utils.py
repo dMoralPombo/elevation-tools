@@ -496,6 +496,32 @@ def transform_to_3413(point_wgs84):
     return (point[0][0], point[1][0])
 
 
+@lru_cache(maxsize=1)
+def _mosaic_index():
+    """The ArcticDEM mosaic tile index (EPSG:3413), read once per session."""
+    return gpd.read_file(get_mosaic_index_path())
+
+
+def mosaic_dem_path(lon, lat):
+    """Path to the 2 m mosaic tile DEM containing (lon, lat), or None.
+
+    None when no index tile contains the point or the tile isn't in the
+    archive (e.g. Svalbard, never downloaded).
+    """
+    try:
+        index = _mosaic_index()
+    except Exception as e:
+        print(f"⚠ Mosaic index unreadable ({e})")
+        return None
+    pt = gpd.GeoSeries(gpd.points_from_xy([lon], [lat]), crs="EPSG:4326").to_crs(index.crs)
+    hit = index[index.geometry.contains(pt.iloc[0])]
+    if hit.empty:
+        return None
+    row = hit.iloc[0]
+    path = f"{MOSAIC_DIR}{row['supertile']}/{row['tile']}_2m_v4.1_dem.tif"
+    return path if os.path.exists(path) else None
+
+
 def transect_from_mosaic(coords_4326, num_samples=100):
     """Get elevation profile from a mosaic using provided origin and end coordinates.
 
