@@ -5,6 +5,7 @@ Coordinate transformations, file I/O, elevation extraction, and STAC queries.
 """
 
 import glob
+import json
 import os
 import re
 import tarfile
@@ -24,7 +25,7 @@ from rasterio.enums import Resampling
 from config import (
     STAC_API_URL, COLLECTION_ID, DEFAULT_CRS, GEOGRAPHIC_CRS,
     DEFAULT_WINDOW_SIZE, DEFAULT_WINDOW_TYPE, MAX_CLOUD_COVER, COREG_PARAMS,
-    MOSAIC_DIR, get_mosaic_index_path
+    MOSAIC_DIR, get_mosaic_index_path, IS2_SCHEME_PARAMS, STACK_LOGBOOK
 )
 
 
@@ -155,8 +156,16 @@ def coreg_suffix(coreg_mode):
 
     Built from COREG_PARAMS, e.g. for 'altim':
     "_cs2_v_999-0_dh_999-0000_['vertical_offset_mean', 'nuthkaab', 'deramp']"
+    ('is2' mode has two suffixes, one per reference: see IS2_SCHEME_PARAMS.)
     """
-    params = COREG_PARAMS[coreg_mode]
+    if coreg_mode == 'is2':
+        raise ValueError("'is2' mode has one suffix per reference: use "
+                         "_params_suffix(IS2_SCHEME_PARAMS[...])")
+    return _params_suffix(COREG_PARAMS[coreg_mode])
+
+
+def _params_suffix(params):
+    """Coregistered-file suffix for one parameter set (see coreg_suffix)."""
     recipe = str(params['coreg_choice'].split())
     return (f"_{params['reference_data']}_v_{params['filter_vel']}-0"
             f"_dh_{params['filter_dhdt']}-0000_{recipe}")
@@ -169,6 +178,55 @@ def _list_geocell(archdir, geocell):
         return tuple(os.listdir(os.path.join(archdir, geocell)))
     except OSError:
         return ()
+
+
+@lru_cache(maxsize=1)
+def new_scheme_stacks():
+    """Finished `--prefer is2` stacks from GLOBE's logbook: ((tile, store_dir), ...).
+
+    Empty if the logbook (config.STACK_LOGBOOK) or duckdb isn't available.
+    Cached for the session; re-import the module to refresh.
+    """
+    query = ("SELECT tile, store_dir FROM stack_runs "
+             "WHERE coreg_suffix LIKE '%cs2fb20m%' ORDER BY tile")
+    try:
+        import duckdb
+        try:
+            with duckdb.connect(STACK_LOGBOOK, read_only=True) as con:
+                rows = con.execute(query).fetchall()
+        except duckdb.Error:
+            # A running GLOBE job holds the file's lock (DuckDB allows one
+            # writer and no other readers): read a local temporary copy
+            import shutil
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp:
+                copy = os.path.join(tmp, "stacking_tracking.duckdb")
+                shutil.copyfile(STACK_LOGBOOK, copy)
+                with duckdb.connect(copy, read_only=True) as con:
+                    rows = con.execute(query).fetchall()
+        return tuple((t, d) for t, d in rows if d and os.path.isdir(d))
+    except Exception as e:
+        print(f"⚠ GLOBE stack logbook not readable ({e}); 'is2' mode takes "
+              f"the ICESat-2 file when a strip has both")
+        return ()
+
+
+@lru_cache(maxsize=4096)
+def _stack_mission(pair):
+    """'is2' or 'cs2': the reference a finished new-scheme stack used for this
+    strip pair (from its per-strip zarr attributes), or None if none has it."""
+    for _tile, store_dir in new_scheme_stacks():
+        for name in (f"processed_{pair}_dt.zarr", f"processed_{pair}.zarr"):
+            attrs = os.path.join(store_dir, name, ".zattrs")
+            if os.path.exists(attrs):
+                try:
+                    with open(attrs) as f:
+                        mission = json.load(f).get("mission")
+                except (OSError, ValueError):
+                    continue
+                if mission in IS2_SCHEME_PARAMS:
+                    return mission
+    return None
 
 
 def find_strip_file(archdir, geocell, strip, coreg_mode='none'):
@@ -188,6 +246,9 @@ def find_strip_file(archdir, geocell, strip, coreg_mode='none'):
         'none'  -> an unpacked '_dem.tif' with its '_bitmask.tif' beside it
                    (fast windowed reads), else the strip '.tar.gz' (read in
                    memory by open_dem)
+        'is2'   -> (temporary) the `--prefer is2` scheme's GeoTIFF: the
+                   ICESat-2 file or the CryoSat-2 (no Nuth-Kaab) one; if both
+                   exist, the one the strip's finished stack used (else IS2)
         'altim' / 'mosaic' -> the coregistered GeoTIFF whose suffix exactly
                    matches coreg_suffix(coreg_mode). The doubled-prefix
                    variant ('_cs2_v_cs2_v_...', an upstream naming bug) is
@@ -203,6 +264,22 @@ def find_strip_file(archdir, geocell, strip, coreg_mode='none'):
     pair, seg = (m['pair'], m['seg']) if m else (strip, None)
     seg_rx = re.escape(seg) if seg else r"seg\d+"
     head = rf"SETSM_s2s041_{re.escape(pair)}_2m_(?:lsf_)?(?P<seg>{seg_rx})"
+
+    if coreg_mode == 'is2':
+        names = _list_geocell(archdir, geocell)
+        found = {}
+        for ref, params in IS2_SCHEME_PARAMS.items():
+            rx = re.compile(head + re.escape(f"_dem{_params_suffix(params)}_coregistered.tif") + "$")
+            hits = sorted((int(m['seg'][3:]), n) for n in names if (m := rx.match(n)))
+            if hits:
+                found[ref] = hits[0][1]
+        if not found:
+            return None
+        if len(found) == 2:
+            ref = _stack_mission(pair) or 'is2'
+        else:
+            ref = next(iter(found))
+        return os.path.join(archdir, geocell, found[ref])
 
     if coreg_mode == 'none':
         # (tail, needs its '_bitmask.tif' alongside). An unpacked strip is read

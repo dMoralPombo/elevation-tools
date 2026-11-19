@@ -82,7 +82,7 @@ Cells after "View results" (temporal analysis, lake detection, optional batches)
 | Parameter | Meaning |
 |---|---|
 | `TIME_RANGE` | `"YYYY-MM-DD/YYYY-MM-DD"`. ArcticDEM strips span 2009 to the present. |
-| `COREG_MODE` | `'none'`, `'altim'` or `'mosaic'` (next section). |
+| `COREG_MODE` | `'none'`, `'altim'`, `'mosaic'` or `'is2'` (next section). |
 | `WINDOW_SIZE`, `WINDOW_TYPE` (01) | Pixels averaged around each point: `3` = 3×3. `'square'` = full window, `'cross'` = centre row and column. The spread across the window is reported as the uncertainty. |
 | `MAX_DEMS` (02) | Cap on the number of strips; `'none'` mode is slower, so it's capped lower. |
 | `MAX_CLOUD_COVER` | Drop strips whose catalogue cloud fraction (0–1) is above this. |
@@ -94,9 +94,10 @@ Each strip in the archive exists raw, and some also exist coregistered (aligned 
 
 | Mode | File read | Notes |
 |---|---|---|
-| `none` | the raw strip `.tar.gz`, read in memory | Every strip is available, but each can be offset by metres. Cloud, water and edge pixels are removed using the strip's bitmask. Slowest mode. |
+| `none` | the raw strip (an unpacked copy if the archive has one, else the `.tar.gz`, read in memory) | Every strip in the archive is available, but each can be offset by metres. Cloud, water and edge pixels are removed using the strip's bitmask. Slowest mode. |
 | `altim` | the strip coregistered to CryoSat-2 altimetry | Works inland. Over gentle, sparsely sampled ice the horizontal fit can fail, so check large outliers. |
 | `mosaic` | the strip coregistered to the ArcticDEM mosaic | Uses control points on **exposed bedrock** only, so it's reliable near the ice margin and unavailable far inland. |
+| `is2` | the strip coregistered with the new scheme: ICESat-2 where available (Oct 2018 on), CryoSat-2 otherwise | **Temporary:** will replace `altim`. Only a few 50 km tiles are done so far; the interactive maps outline them in orange. |
 
 A strip that hasn't been coregistered in the chosen mode is skipped. The exact coregistered files used are set by `COREG_PARAMS` in `config.py`.
 
@@ -136,6 +137,7 @@ notebooks/             the notebooks (old/ holds retired versions);
 ## Limitations
 
 - Greenland/Arctic only (EPSG:3413), and only the `arcticdem-strips-s2s041-2m` collection.
+- Svalbard works in `'none'` mode only, and the archive there is incomplete (some geocells were never downloaded).
 - The paths assume the CPOM luna layout. Elsewhere, set the environment variables above.
 - Reading many strips is slow and memory-hungry; `'none'` mode most of all.
 
