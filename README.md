@@ -16,21 +16,29 @@ The tools search the PGC catalogue (STAC API) for every strip over your point or
 
 ## Quick start (CPOM2)
 
-You need an account on the CPOM2 virtual machine, with the luna share mounted at `~/luna`. The tools search the PGC catalogue online, so the VM also needs internet access.
+You need an account on the CPOM2 virtual machine, with the luna share mounted at `~/luna`. The tools search the PGC catalogue online, so the VM also needs internet access. No GitHub account is needed.
 
 ```bash
 # 1. Get the code
+cd ~
 git clone https://github.com/dMoralPombo/elevation-tools.git
 cd elevation-tools
 
-# 2. Create the environment (once)
-conda env create -f environment.yml
-conda activate elevation-tools
-#   or, in an existing environment: pip install -r requirements.txt
+# 2. Use an environment you already have...
+conda activate <your-env>
+python -c "import numpy, pandas, polars, geopandas, shapely, pyproj, rasterio, matplotlib, scipy, pystac_client, tqdm, geopy, ipyleaflet, ipywidgets"
+#    ...if that complains, install only what's missing:  pip install <package>
+#    (no suitable environment? create one:
+#     conda env create -f environment.yml && conda activate elevation-tools)
 
-# 3. Check the paths
+# 3. Check the paths (and see where your outputs will go)
 python -c "import config"
+
+# 4. Open a notebook
+code notebooks/01_history_multimode.ipynb
 ```
+
+In step 2, avoid `pip install -r requirements.txt` in an environment you share with other projects: it can upgrade packages they rely on. Notebooks 01 and 02 only need the packages in the check; `duckdb` is optional (it draws the tiles ready for `'is2'` mode on the maps), and the rest of `requirements.txt` is for notebooks 03 and 04. To get later updates, run `git pull` inside the folder.
 
 Step 3 prints the paths the tools will use, with a ✓ or a warning for each:
 
@@ -50,7 +58,41 @@ export LUNA_ROOT=/path/to/luna/CPOM
 
 The output folder is created the first time you import the tools.
 
-Then open a notebook in `notebooks/`, in Jupyter or in the VSCode Interactive window, and run the cells in order.
+Then open a notebook in `notebooks/` and run the cells in order.
+
+### Other ways to run
+
+- **VS Code** (recommended): open the notebook over Remote-SSH and pick your environment as the kernel.
+- **JupyterLab in your browser:** on CPOM2, run `jupyter lab --no-browser --port 8888` in your environment. On your own computer, run `ssh -N -L 8888:localhost:8888 <user>@<CPOM2 address>`, then open the link JupyterLab printed. The interactive maps work here too, if `ipyleaflet` is installed in that environment.
+- **Plain terminal (no maps):** call the same functions from a script and type the coordinates in. Plots are saved as PNGs under your output folder instead of being shown:
+
+```python
+# my_run.py: save in the repository folder and run with  python my_run.py
+import matplotlib
+matplotlib.use("Agg")           # no windows: plots are saved as PNGs
+
+from config import ARCHIVE_DIR, OUTPUT_DIR
+from analysis import (run_elevation_history, run_transect_analysis,
+                      plot_combined_profiles, plot_relative_differences,
+                      plot_difference_heatmap)
+
+# Elevation history at a point (lon, lat)
+run_elevation_history(ARCHIVE_DIR, coreg_mode='is2', coords=(-48.111, 63.344),
+                      time_range="2010-01-01/2026-12-31", window_size=5,
+                      max_cloud_cover=0.99, lake_name="my_point")
+
+# Transect: ((lon1, lat1), (lon2, lat2))
+profiles = run_transect_analysis(ARCHIVE_DIR, coreg_mode='is2',
+                                 transect_coords=((-48.14, 63.344), (-48.08, 63.344)),
+                                 time_range="2010-01-01/2026-12-31", max_dems=20,
+                                 max_cloud_cover=0.99, lake_name="my_line")
+plot_combined_profiles(profiles, coreg_mode='is2', lake_name="my_line")
+plot_relative_differences(profiles, coreg_mode='is2', lake_name="my_line",
+                          output_path=OUTPUT_DIR)
+plot_difference_heatmap(profiles, coreg_mode='is2', lake_name="my_line")
+```
+
+The terminal route skips the notebooks' extras (the map pickers, the outlier filter in 02, the experimental last cells).
 
 ### Lake volume notebook (03)
 
