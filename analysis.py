@@ -35,7 +35,7 @@ from elevation_utils import (
 )
 from config import (
     OUTPUT_DIR, DEFAULT_NUM_SAMPLES, DEFAULT_WINDOW_SIZE,
-    DEFAULT_WINDOW_TYPE, get_output_path
+    DEFAULT_WINDOW_TYPE, get_output_path, mode_tag
 )
 
 # ============================================================================
@@ -233,7 +233,7 @@ def process_elevation_history(
         (lon, lat) in WGS84
     window_size, window_type : as in get_elevation_window
     coreg_mode : str
-        'none', 'altim', or 'mosaic'
+        'none', 'altim', 'mosaic' or 'is2' (temporary; see find_strip_file)
     lake_name : str, optional
         Name for plot titles
     time_range : str, optional
@@ -351,7 +351,7 @@ def process_elevation_profiles(
     num_samples : int
         Points along transect
     coreg_mode : str
-        'none', 'altim', or 'mosaic'
+        'none', 'altim', 'mosaic' or 'is2' (temporary; see find_strip_file)
     time_range : str, optional
         Requested "YYYY-MM-DD/YYYY-MM-DD" range, recorded for output filenames
     strip_ids : list, optional
@@ -739,12 +739,12 @@ def plot_elevation_history(history, output_path=None, coreg_mode='none', lake_na
     if lake_name is None:
         output_path = os.path.join(
             out_dir,
-            f"elevation_history_{coords[0]:.3f}_{coords[1]:.3f}_{coreg_mode}_{years}.png"
+            f"elevation_history_{coords[0]:.3f}_{coords[1]:.3f}_{mode_tag(coreg_mode)}_{years}.png"
         )
     else:
         output_path = os.path.join(
             out_dir,
-            f"elevation_history_{lake_name}_{coords[0]:.3f}_{coords[1]:.3f}_{coreg_mode}_{years}.png"
+            f"elevation_history_{lake_name}_{coords[0]:.3f}_{coords[1]:.3f}_{mode_tag(coreg_mode)}_{years}.png"
         )
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -1065,10 +1065,10 @@ def plot_combined_profiles(all_profiles, coreg_mode='none', cmap='terrain', lake
     output_path = OUTPUT_DIR
     if lake_name is not None:
         output_name = os.path.join(output_path, "transects_combined", 
-                                  f"profile_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+                                  f"profile_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{mode_tag(coreg_mode)}.png")
     else:
         output_name = os.path.join(output_path, "transects_combined", 
-                                  f"profile_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+                                  f"profile_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{mode_tag(coreg_mode)}.png")
 
     os.makedirs(os.path.dirname(output_name), exist_ok=True)
     fig.savefig(output_name, dpi=150, bbox_inches="tight")
@@ -1154,8 +1154,10 @@ def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, 
     # HEATMAP
     ax1 = fig.add_subplot(gs[0])
     
-    max_abs_diff = np.nanmax(np.abs(diff_matrix))
-    vlim = max(5, max_abs_diff)
+    # Colour limits from the 98th percentile of |change|, so one spike (a bad
+    # strip edge) doesn't wash out real metre-scale change; at least ±1 m
+    abs_diff = np.abs(np.ma.filled(np.ma.masked_invalid(diff_matrix).astype(float), np.nan))
+    vlim = max(1.0, float(np.nanpercentile(abs_diff, 98))) if np.isfinite(abs_diff).any() else 5.0
     
     im = ax1.imshow(diff_matrix, aspect='auto', cmap='RdBu', 
                    extent=[0, transect_km[-1], len(dates)-0.5, -0.5],
@@ -1178,7 +1180,8 @@ def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, 
     ax1.set_xlabel('Distance along transect (km)', fontsize=12)
     ax1.set_title(title, fontsize=13, pad=10, fontweight='bold')
     
-    # cbar = plt.colorbar(im, ax=ax1, label='Elevation Change (m)', fraction=0.05, pad=0.02)
+    cbar = fig.colorbar(im, ax=ax1, fraction=0.04, pad=0.02, extend='both')
+    cbar.set_label('Elevation change vs reference (m)', fontsize=11)
     
     # Mark reference line - improved positioning
     ref_idx = profiles_sorted.index(reference_profile)
@@ -1272,10 +1275,10 @@ def plot_difference_heatmap(all_profiles, coreg_mode=None, reference_year=None, 
 
     if lake_name is not None:
         output_name = os.path.join(output_path, "transects_combined", 
-                                  f"heatmap_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+                                  f"heatmap_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{mode_tag(coreg_mode)}.png")
     else:
         output_name = os.path.join(output_path, "transects_combined", 
-                                  f"heatmap_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+                                  f"heatmap_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{mode_tag(coreg_mode)}.png")
 
     fig.savefig(output_name, dpi=150, bbox_inches="tight")
     print(f"Heatmap saved to: {output_name}")
@@ -2023,10 +2026,10 @@ def plot_relative_differences(all_profiles, coreg_mode, lake_name=None, output_p
 
         if lake_name is not None:
             output_name = os.path.join(output_path, "transects_combined", 
-                                    f"profile_diff_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+                                    f"profile_diff_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{mode_tag(coreg_mode)}.png")
         else:
             output_name = os.path.join(output_path, "transects_combined", 
-                                    f"profile_diff_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+                                    f"profile_diff_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{mode_tag(coreg_mode)}.png")
         os.makedirs(os.path.dirname(output_name), exist_ok=True)
         fig.savefig(output_name, dpi=150, bbox_inches="tight")
         print(f"Plot saved to: {output_name}")
@@ -2051,7 +2054,7 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     output_path : str, optional
         Output directory
     coreg_mode : str
-        'none', 'altim', or 'mosaic'
+        'none', 'altim', 'mosaic' or 'is2' (temporary; see find_strip_file)
     coords : tuple, optional
         (lon, lat) in WGS84
     time_range : str
@@ -2106,12 +2109,7 @@ def run_elevation_history(archdir, output_path=None, coreg_mode='none',
     # Save data
     year_i, year_f = history['year_span']
     
-    if coreg_mode == 'none':
-        suf = '_none'
-    elif coreg_mode == 'altim':
-        suf = '_altim'
-    else:
-        suf = '_mosaic'
+    suf = f'_{mode_tag(coreg_mode)}'   # '_nc', '_altim', '_mosaic', '_is2'
     
     if lake_name is None:
         data_path = get_output_path(
@@ -2150,7 +2148,7 @@ def run_transect_analysis(archdir, output_path=None, coreg_mode='none',
     output_path : str, optional
         Output directory
     coreg_mode : str
-        'none', 'altim', or 'mosaic'
+        'none', 'altim', 'mosaic' or 'is2' (temporary; see find_strip_file)
     transect_coords : tuple, optional
         ((start_lon, start_lat), (end_lon, end_lat))
     time_range : str
@@ -2208,13 +2206,13 @@ def run_transect_analysis(archdir, output_path=None, coreg_mode='none',
         data_path = get_output_path(
             'transects_combined',
             f"profile_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}_"
-            f"{year_start}-{year_end}_{coreg_mode}.txt"
+            f"{year_start}-{year_end}_{mode_tag(coreg_mode)}.txt"
         )
     else:
         data_path = get_output_path(
             'transects_combined',
             f"profile_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}_"
-            f"{year_start}-{year_end}_{coreg_mode}.txt"
+            f"{year_start}-{year_end}_{mode_tag(coreg_mode)}.txt"
         )
     
     with open(data_path, 'w') as f:

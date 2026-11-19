@@ -27,7 +27,7 @@ from analysis import (
 )
 from config import (
     OUTPUT_DIR, DEFAULT_NUM_SAMPLES, DEFAULT_WINDOW_SIZE,
-    DEFAULT_WINDOW_TYPE, COREG_PARAMS, get_output_path
+    DEFAULT_WINDOW_TYPE, COREG_PARAMS, get_output_path, mode_tag
 )
 
 
@@ -663,10 +663,10 @@ def plot_lake_detection_results(all_profiles, lake_results, coreg_mode,
     
     if lake_name:
         output_path = get_output_path('transects_combined',
-            f"profile_lakes_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+            f"profile_lakes_{lake_name}_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{mode_tag(coreg_mode)}.png")
     else:
         output_path = get_output_path('transects_combined',
-            f"profile_lakes_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{coreg_mode}.png")
+            f"profile_lakes_{xs:.3f}_{ys:.3f}_{xe:.3f}_{ye:.3f}-{yearstart}-{yearend}_{mode_tag(coreg_mode)}.png")
     
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.show()

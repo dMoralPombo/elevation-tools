@@ -105,6 +105,39 @@ COREG_PARAMS = {
     'none': {}
 }
 
+# 'is2' mode (TEMPORARY, to replace 'altim' once the new scheme covers the
+# tiles in use): GLOBE's `--prefer is2` scheme writes, per strip, either an
+# ICESat-2 file (with Nuth-Kaab) or a CryoSat-2 file (without). When a strip has
+# both, the one its finished stack used is taken (see STACK_LOGBOOK).
+IS2_SCHEME_PARAMS = {
+    'is2': {
+        'reference_data': 'is2',
+        'coreg_choice': 'vertical_offset_mean nuthkaab deramp',
+        'filter_vel': '999',
+        'filter_dhdt': '999',
+    },
+    'cs2': {
+        'reference_data': 'cs2',
+        'coreg_choice': 'vertical_offset_mean deramp',
+        'filter_vel': '999',
+        'filter_dhdt': '999',
+    },
+}
+COREG_MODES = ('none', 'altim', 'mosaic', 'is2')
+
+
+def mode_tag(coreg_mode):
+    """Coreg mode as written in output file names: 'nc' for 'none' (not
+    coregistered), the mode itself otherwise ('altim', 'mosaic', 'is2')."""
+    return 'nc' if coreg_mode == 'none' else str(coreg_mode)
+
+# GLOBE's stacking logbook: finished stacks per tile (store_dir, strip names).
+# 'is2' mode reads it to show the finished new-scheme tiles and to follow each
+# stack's IS2/CS2 choice. Not reachable -> those extras are skipped.
+STACK_LOGBOOK = os.path.expanduser(os.getenv(
+    'GLOBE_STACK_LOGBOOK',
+    os.path.join(LUNA_ROOT, 'moralpom', 'globe', 'data', 'stacking_tracking.duckdb')))
+
 # ============================================================================
 # VALIDATION AND SETUP
 # ============================================================================

@@ -5,11 +5,12 @@ Provides interactive leaflet maps for selecting points and transects.
 Uses ipyleaflet for map display in Jupyter notebooks.
 """
 
+import json
 import time
 from IPython.display import clear_output, display
 from ipyleaflet import (
     Map, Marker, Polyline, FullScreenControl,
-    GeoJSON, WidgetControl, AwesomeIcon, basemaps
+    GeoJSON, WidgetControl, AwesomeIcon, basemaps, LegendControl
 )
 from ipywidgets import HTML, Button, HBox, Layout, VBox, widgets
 from pyproj import Transformer
@@ -19,6 +20,39 @@ from shapely.geometry import shape, mapping
 from geopy.distance import distance as geopy_distance
 
 from elevation_utils import transform_bounds_to_wgs84
+
+
+NEW_COREG_COLOR = "#ff7f00"
+
+
+def add_new_coreg_tiles(m):
+    """Outline on map `m` the 50 km tiles with finished new-scheme coregistrations.
+
+    These are the tiles where COREG_MODE = 'is2' has full coverage (GLOBE's
+    `--prefer is2` stacks listed in the logbook). Returns the tile ids; draws
+    nothing (and returns []) if the logbook or mosaic index can't be read.
+    """
+    try:
+        from elevation_utils import new_scheme_stacks, _mosaic_index
+        tiles = sorted({t for t, _ in new_scheme_stacks()})
+        if not tiles:
+            return []
+        index = _mosaic_index()
+        sel = index[index["tile"].isin(tiles)][["tile", "geometry"]].to_crs("EPSG:4326")
+    except Exception as e:
+        print(f"⚠ Could not draw the new-coregistration tiles ({e})")
+        return []
+    m.add_layer(GeoJSON(
+        data=json.loads(sel.to_json()),
+        style={"color": NEW_COREG_COLOR, "fillColor": NEW_COREG_COLOR,
+               "opacity": 0.9, "fillOpacity": 0.12, "weight": 2},
+        hover_style={"fillOpacity": 0.35},
+        name="New coregistration ('is2' mode)",
+    ))
+    m.add_control(LegendControl(
+        {f"COREG_MODE='is2' ready: {', '.join(tiles)}": NEW_COREG_COLOR},
+        title="", position="bottomleft"))
+    return tiles
 
 
 def select_point_interactive(timeout=2):
